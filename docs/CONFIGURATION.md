@@ -2448,6 +2448,24 @@ disconnect cleared the status) was removed when the turn-boundary emits
 moved into the engine — so consumers should only ever see the three
 listed kinds.
 
+### Boundary pairing and crash repair
+
+`turn_start`/`turn_end` records carry a **stable per-surface identity** —
+one id per surface (`tui`, `exec`), minted once and persisted under the
+codewhale home, claimed via a non-blocking lock for the session lifetime
+(a concurrent live instance of the same surface falls back to an
+ephemeral id) — plus a per-run turn id minted before dispatch, so a
+supervisor can pair boundaries even though the engine changes session
+ids during a run. A session killed mid-turn is repaired: a catchable
+signal flushes a synthetic `turn_end` (`status: "interrupted"`,
+`payload.reconciled: true`) under a bounded deadline, and a SIGKILL —
+which runs no code — is covered by the next launch's **boot
+reconciliation**, which scans for the same identity and pairs the orphan.
+A torn trailing line from a crash mid-write is truncated away before the
+next append, and any serialized line above a hard size ceiling is
+refused, so the file always parses line by line; shutdown drains queued
+events under a bounded deadline with a writer completion receipt.
+
 ### File contract
 
 Each line is a `RuntimeEventEnvelope`:

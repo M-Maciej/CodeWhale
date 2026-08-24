@@ -300,6 +300,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - TUI sessions now apply a subtle OSC 12 cursor accent only on explicitly
   supported terminals and restore the terminal default through normal, panic,
   and signal cleanup paths (#5554).
+- Optional machine-readable lifecycle event outbox
+  (`[lifecycle_outbox]` config table): opt-in JSONL event stream
+  (`turn_start` / `turn_end` / `turn_stalled` / `subagent_spawn` /
+  `subagent_complete` / `session_start` / `session_end`) for interactive TUI
+  sessions and headless `codewhale exec` runs, with an optional webhook fan-out
+  of the same events. Unset or empty `path` keeps the feature off and behavior
+  unchanged. Every payload carries the resolved `workspace` for routing;
+  subagent events additionally carry `subagent`. `seq` is monotonic across
+  processes sharing one outbox file (exclusive-lock appends + tail recovery),
+  and a session owns its turn boundaries: catchable-signal shutdown appends a
+  synthetic `turn_end` for open turns, and boot reconciliation pairs turns a
+  SIGKILLed session left unpaired — keyed on a stable per-surface identity
+  (persisted under the codewhale home, claimed for the session lifetime) so
+  the next launch finds the killed process's records, and `exec` mints one
+  thread+turn identity per run so its boundaries correlate. A torn trailing
+  line from a crash mid-write is repaired under the lock, oversized envelopes
+  are refused (the 64 KiB recovery window stays reachable), and shutdown
+  drains queued events under a bounded deadline with a writer completion
+  receipt. Bounded preview/redaction rules apply to
+  every field. Design record: `docs/rfcs/1365-lifecycle-outbox.md` (#5531).
 
 ## [0.9.11] - 2026-08-22
 

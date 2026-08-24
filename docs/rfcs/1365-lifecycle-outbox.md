@@ -133,10 +133,14 @@ Two groups, one per surface, both reviewable against the event table in
   watchdog, `subagent_spawn`/`subagent_complete` at the observer site,
   `session_start`/`session_end` at the hook fire sites — every payload
   carrying `workspace`, sub-agent payloads carrying `subagent` (§4.4)
-- **exec**: `turn_start` at `Op::SendMessage` dispatch and `turn_end` at
-  the terminal `TurnComplete`, **plus** the folded `turn.failed` on the
+- **exec**: one minted run identity before dispatch — the stable `exec`
+  surface id plus a per-run turn id carried by both boundaries — with
+  `turn_start` at `Op::SendMessage` dispatch and `turn_end` at the
+  terminal `TurnComplete`, **plus** the folded `turn.failed` on the
   "engine channel closed before a terminal receipt" path so every emitted
-  `turn_start` has a matching `turn_end`
+  `turn_start` has a matching `turn_end`; exec also registers the
+  terminating-signal context and runs boot reconciliation, so a killed
+  run leaves no permanent orphan
 
 Non-goals: no app-server/ACP sites (scope table), no transcript or tool
 payload content — payloads are bounded and pre-redacted only.
@@ -201,10 +205,12 @@ Each line is one complete envelope
   **and** the O_APPEND write itself, so `seq` is unique and
   file-order-increasing across concurrent writers sharing one file — the
   machine-wide outbox pattern, where a read-then-append race produced
-  duplicate seqs and out-of-order appends. Recovery is unchanged
-  otherwise: outbox lines are bounded far below the tail window, so the
-  last complete line is always inside it, and a torn trailing line from a
-  crash mid-write is ignored (the previous newline-terminated line wins).
+  duplicate seqs and out-of-order appends. Outbox lines are bounded far
+  below the tail window, so the last complete line is always inside it,
+  and a torn trailing line from a crash mid-write is **repaired, not
+  ignored**: recovery truncates the torn suffix under the lock before the
+  next append, so torn JSON and the new envelope can never fuse into one
+  unparseable line (`recover_last_seq`, `crates/hooks/src/lifecycle_outbox.rs`).
 - **Single writer per process.** `emit` never blocks the caller: it
   enqueues on an unbounded channel and a single lazily-spawned writer
   task serializes appends in order (`ensure_writer_spawned` at
@@ -216,7 +222,10 @@ Each line is one complete envelope
   writers can interleave *lines* but never splice one and never duplicate
   or reorder a `seq`. With no tokio runtime available (or after the
   writer task is gone) events are dropped with a warning — the outbox is
-  observability, not control flow.
+  observability, not control flow. At shutdown, `close` + `flush` /
+  `flush_blocking` drain the queue under a deadline and the writer's
+  completion receipt reports the appended count — a bounded, deterministic
+  exit flush.
 - **Cross-process sharing is supported.** The `<path>.lock` sidecar is a
   zero-byte file created next to the outbox (`outbox_lock_path` at
   `crates/hooks/src/lifecycle_outbox.rs:371`); the lock is advisory, so
@@ -234,9 +243,14 @@ and ANSI escapes, collapses whitespace, truncates to a character ceiling
 (Unicode-scalar counted, UTF-8 safe) with the `…` marker, and enforces
 the same ceilings as the desktop notification payloads:
 `OUTBOX_HEADLINE_MAX_CHARS` 80, `OUTBOX_DETAIL_MAX_CHARS` 120,
-`OUTBOX_PREVIEW_MAX_CHARS` 200 (`crates/hooks/src/lifecycle_outbox.rs:57-59`).
+`OUTBOX_PREVIEW_MAX_CHARS` 200, `OUTBOX_PATH_MAX_CHARS` 512
+(`crates/hooks/src/lifecycle_outbox.rs:57-59`).
 This is the invariant that makes the 64 KiB tail-scan recovery correct:
-a line can never approach that window.
+a line can never approach that window. The invariant is also enforced
+mechanically: the append choke point refuses any serialized line above
+`MAX_OUTBOX_LINE_BYTES` (60 KiB, below the recovery window) instead of
+writing a line that could push the last complete record out of the tail
+scan.
 
 ### 4.4 Routing fields: `workspace` on every event, `subagent` on sub-agent events
 
@@ -299,24 +313,37 @@ in-progress turn.
 A session **owns** its turn events: the process that starts a turn is the
 one that ends it — except when it cannot. A session killed mid-turn
 (SIGKILL, a closed pane, a crashed host) dies between the `turn_start`
-and `turn_end` appends and cannot run the emit. Ownership is recovered by
-a single reconciliation mechanism that both surviving paths share:
+and `turn_end` appends and cannot run the emit. Ownership is keyed on a
+**stable cross-process identity**: one id per surface (`tui`, `exec`),
+minted once and persisted under the codewhale home
+(`crates/tui/src/outbox_identity.rs`), reused on every launch, and
+claimed via a non-blocking `flock`/`LockFileEx` for the session lifetime.
+A second live instance of the same surface loses the non-blocking acquire
+and falls back to an ephemeral id, so two live sessions never share the
+pairing key. When the holder dies — SIGKILL included — the kernel drops
+the flock and the next boot takes the stable id. A single recovery
+mechanism serves both surviving paths:
 
 - **Graceful shutdown.** The TUI's terminating-signal cleanup task
   (`spawn_signal_cleanup_task`, `crates/tui/src/lib.rs:699`) calls
-  `LifecycleOutbox::reconcile_interrupted_turns` (via
+  `LifecycleOutbox::reconcile_interrupted_turns_bounded` (via
   `crates/tui/src/outbox_signal.rs`) for SIGTERM/SIGINT/SIGHUP before the
   process exits, appending a synthetic `turn_end` for every turn this
-  session left open.
+  session left open. The whole flush runs under a total deadline (lock
+  wait + scan + appends) so a wedged or contended outbox can never trap
+  the exit, and a second fatal signal bypasses the cleanup entirely.
 - **Boot reconciliation.** SIGKILL runs no code, so nothing can be
-  appended at death. On the next session start the TUI reconciles *before*
-  its first emit (`crates/tui/src/tui/ui/event_loop.rs:507`), and the same
-  scan pairs anything the killed process left behind.
+  appended at death. On the next session start the TUI (and exec)
+  reconciles *before* its first emit
+  (`crates/tui/src/tui/ui/event_loop.rs:507`,
+  `crates/tui/src/lib.rs` exec path), and the same scan pairs anything
+  the killed process left behind — possible because the relaunched
+  session emits under the same stable identity the killed process used.
 
 Both paths derive the open turn from the **file** (a `turn_start` with no
 matching `turn_end` for the same `thread_id`), never from in-memory state:
 the flush waits (bounded) for the process's own queued events to drain,
-then scans the whole file and appends under the outbox's cross-process
+then scans the file and appends under the outbox's cross-process
 exclusive lock — one lock acquisition across scan + appends — so a
 reconciler racing another session's writer (or a second reconciler)
 serializes and never double-appends.
@@ -363,20 +390,26 @@ workspace-routed consumers keep seeing the same routing field.
   `<path>.lock` sidecar and re-recovers the tail, so one shared file
   yields unique, increasing seqs across sessions; the sidecar file is the
   only new on-disk artifact.
-- **SIGKILL reconciliation depends on a stable thread id across the
-  restart** (§4.7): boot reconciliation scans for the *current* session's
-  `thread_id`, so it pairs a killed process's unpaired start only when the
-  relaunched session emits under the same id (resumed sessions that key
-  the outbox on the persisted session id; a fresh hook-session id does
-  not). The file format and the reconciliation mechanism are id-stable;
-  the deployment chooses the id policy.
-- **Graceful-shutdown flush is best effort**: it waits a bounded 2 s for
-  the session's own queued events to drain and appends under the outbox
-  lock, but a wedged writer (or a second fatal signal) can still exit
-  before the line lands — the next boot's reconciliation is the backstop.
-- **Fresh `exec` runs have an empty `thread_id` on `turn_start`.** The
-  session id is minted only at persistence time; a supervisor correlating
-  runs can key on process + file.
+- **SIGKILL reconciliation uses a stable cross-process identity** (§4.7):
+  boot reconciliation scans for the *current* surface's identity, and the
+  identity is persisted per surface and claimed for the session lifetime,
+  so a relaunched session pairs a killed process's unpaired start without
+  any resumed-session precondition. A concurrent live instance of the
+  same surface falls back to an ephemeral id (documented in
+  `crates/tui/src/outbox_identity.rs`), which keeps the single-instance
+  path — the supported one — fully correct.
+- **The exit flush is bounded and deterministic** (§4.2): `close` +
+  `flush`/`flush_blocking` drain the queue under a deadline with a writer
+  completion receipt; a wedged writer costs at most the deadline and the
+  next boot's reconciliation is the backstop. The signal path carries its
+  own total budget (lock + scan + appends), and a second fatal signal
+  bypasses a stuck cleanup.
+- **`exec` mints one run identity before dispatch** (§3): the stable
+  `exec` surface id plus a per-run turn id are carried by both
+  boundaries, so `turn_start`/`turn_end` pair regardless of the engine's
+  later session-id changes; exec registers the signal context and runs
+  boot reconciliation like the TUI, so a killed exec run leaves no
+  permanent orphan.
 - **Webhook-only configuration (url without `path`) parses losslessly but
   does not activate the handle.** The file path is the feature gate;
   webhook-only delivery can be lifted later if wanted.
@@ -403,8 +436,14 @@ matching upstream's test layout:
 
 - **`crates/hooks`** — `crates/hooks/src/lifecycle_outbox.rs:531+`:
   append/schema shape; seq recovery across reopen; missing/empty file;
-  torn trailing line ignored; emit ordering under the writer task;
-  concurrent writers sharing one file (unique, increasing seqs, no lost
+  torn trailing line repaired under the lock (seed torn tail → append →
+  every line parses → reopen → append again; an all-torn file truncates
+  and restarts at seq 1); oversized envelopes refused so the recovery
+  window stays reachable; emit ordering under the writer task; exit-flush
+  drain with the writer's completion receipt (late emits after `close` are
+  dropped); bounded lock acquire timing out under contention and the
+  budgeted reconcile stopping at its deadline; concurrent writers sharing
+  one file (unique, increasing seqs, no lost
   lines — `concurrent_writers_share_one_file_with_unique_increasing_seqs`,
   `:714`);
   disabled-outbox no-ops (incl. webhook-only-without-path);
@@ -428,9 +467,21 @@ matching upstream's test layout:
   `crates/tui/tests/integration/main.rs:105`), filter names
   `integration::lifecycle_outbox_exec::…`: exec `turn_start`/`turn_end`
   assert `payload.workspace` equals the `--workspace` directory end to
-  end; no-config writes no file; `outbox_seq_recovers_across_processes`.
+  end, and that both boundaries share one minted thread+turn identity;
+  no-config writes no file; `outbox_seq_recovers_across_processes`;
+  `concurrent_exec_runs_interleave_cleanly_in_one_shared_outbox` (two
+  real processes, one file: unique increasing seqs, every line parses);
+  `killed_exec_run_is_reconciled_by_the_next_run_on_boot` (real
+  two-process kill/relaunch: stalled run SIGKILLed mid-turn, the next
+  run's boot reconciliation pairs the orphan under the stable identity).
   Uses the established harness recipe (wiremock OpenAI-compatible stub,
   `CARGO_BIN_EXE_codewhale-tui`, isolated `$HOME`/XDG, `lock_test_env`).
+- **Identity unit tests** — `crates/tui/src/outbox_identity.rs`: the
+  persisted id survives a restart; a concurrent holder forces an
+  ephemeral id; in-process acquire is idempotent; and the boot
+  reconciliation pairs a prior session's records under the stable
+  identity after the claims are released (the TUI boot path's inputs,
+  tested without a terminal).
 - **Posture** — `crates/tui/src/lib.rs:6031-6044`
   (`doctor_lifecycle_outbox_posture_line`): `off (default)` /
   `on (path: …)`, tested for both states.
@@ -441,8 +492,10 @@ PR 1 is accepted only if:
 
 - unset/empty `path` leaves the feature off with a no-op handle (tested)
 - seq recovery is bounded (tail scan, not full re-read), torn trailing
-  lines are ignored, and cross-process seq assignment is atomic under the
-  outbox's exclusive sidecar lock — concurrent writers sharing one file
+  lines are **repaired** (truncated under the lock, never fused into the
+  next append), oversized envelopes are refused, and cross-process seq
+  assignment is atomic under the outbox's exclusive sidecar lock —
+  concurrent writers sharing one file
   get unique, increasing seqs with no lost lines (tested)
 - `emit` never blocks the caller and ordering is preserved under the
   writer task (tested)

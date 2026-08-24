@@ -13,7 +13,7 @@ mod lifecycle_outbox;
 
 pub use lifecycle_outbox::{
     LifecycleEvent, LifecycleOutbox, OUTBOX_DETAIL_MAX_CHARS, OUTBOX_HEADLINE_MAX_CHARS,
-    OUTBOX_PREVIEW_MAX_CHARS, OUTBOX_TRUNCATION_MARKER, bounded_text,
+    OUTBOX_PATH_MAX_CHARS, OUTBOX_PREVIEW_MAX_CHARS, OUTBOX_TRUNCATION_MARKER, bounded_text,
 };
 
 /// All events that can be emitted through the hook system.

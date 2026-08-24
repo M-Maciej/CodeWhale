@@ -38,7 +38,11 @@
 //! on an internal channel and a single writer task appends lines in order;
 //! concurrent writers sharing one file are serialized by the outbox's
 //! per-append exclusive lock. If no tokio runtime is available the event is
-//! dropped with a warning.
+//! dropped with a warning. At shutdown, [`LifecycleOutbox::close`] +
+//! [`LifecycleOutbox::flush_blocking`] / [`LifecycleOutbox::flush`] drain the
+//! queue under a deadline and the writer's completion receipt proves how many
+//! events landed — a bounded, deterministic exit flush for surfaces that
+//! would otherwise exit with events still in flight.
 //! Webhook POSTs (`{"at": …, "event": …}`) fan out after the local append,
 //! off the append path: delivery uses bounded retries inside the sink (two
 //! retries with exponential back-off) and failures are logged and dropped,
@@ -52,12 +56,18 @@
 //! one that ends it — except when it cannot. A session killed mid-turn
 //! (SIGKILL, a closed pane, a crashed host) dies between the `turn_start`
 //! and `turn_end` appends, leaving an unpaired `turn_start` in the file.
+//! Ownership is keyed on a **stable cross-process identity** (one persisted
+//! id per surface, claimed for the session lifetime), so the next launch of
+//! the same surface emits under the same id and can find the killed
+//! process's records.
 //!
 //! - **Graceful shutdown** closes the loop for catchable signals: the TUI's
-//!   terminating-signal task calls [`LifecycleOutbox::reconcile_interrupted_turns`]
+//!   terminating-signal task calls [`LifecycleOutbox::reconcile_interrupted_turns_bounded`]
 //!   before exiting, which appends a synthetic `turn_end`
 //!   (`status: "interrupted"`, `payload.reconciled: true`, a `reason` naming
-//!   the signal) for every turn this session left open.
+//!   the signal) for every turn this session left open. The whole flush runs
+//!   under a total deadline (lock wait + scan + appends), so a wedged or
+//!   contended outbox can never trap the exit.
 //! - **SIGKILL runs no code**, so nothing can be appended at death; that is
 //!   what **boot reconciliation** covers: on the next session start the
 //!   session calls [`LifecycleOutbox::reconcile_interrupted_turns`] again
@@ -71,6 +81,16 @@
 //! duplicate `turn_end`. The scan and the appends run under the outbox's
 //! exclusive lock, so two reconcilers (or a reconciler racing another
 //! session's writer) serialize and never double-append.
+//!
+//! # Crash consistency
+//!
+//! A crash mid-append leaves a torn trailing line. Recovery **repairs** it
+//! rather than ignoring it: under the lock, the torn suffix is truncated
+//! away before the next append, so torn JSON and the new envelope can never
+//! fuse into one unparseable line. A hard per-line ceiling
+//! ([`MAX_OUTBOX_LINE_BYTES`], below the recovery window) is enforced at the
+//! append choke point, so the tail scan can always reach the last complete
+//! line.
 
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -93,6 +113,11 @@ pub const OUTBOX_HEADLINE_MAX_CHARS: usize = 80;
 pub const OUTBOX_DETAIL_MAX_CHARS: usize = 120;
 pub const OUTBOX_PREVIEW_MAX_CHARS: usize = 200;
 
+/// Ceiling for workspace paths embedded in outbox payloads. Long enough for
+/// any real checkout path; the envelope-level [`MAX_OUTBOX_LINE_BYTES`] guard
+/// is the backstop either way.
+pub const OUTBOX_PATH_MAX_CHARS: usize = 512;
+
 /// Suffix appended when [`bounded_text`] truncates a field.
 pub const OUTBOX_TRUNCATION_MARKER: &str = "…";
 
@@ -100,6 +125,12 @@ pub const OUTBOX_TRUNCATION_MARKER: &str = "…";
 /// bounded (payload ceilings above plus envelope overhead), so a line can
 /// never approach this window and the last complete line is always inside it.
 const SEQ_RECOVERY_TAIL_BYTES: u64 = 64 * 1024;
+
+/// Hard ceiling for one serialized outbox line (JSON + trailing newline).
+/// Enforced at the append choke point so the [`SEQ_RECOVERY_TAIL_BYTES`]
+/// recovery window is always large enough to contain at least one complete
+/// line — the invariant the tail scan depends on.
+const MAX_OUTBOX_LINE_BYTES: u64 = 60 * 1024;
 
 /// Upper bound on concurrently in-flight webhook fan-out tasks. Each
 /// delivery runs bounded retries inside the sink (≈ 30 s worst case against
@@ -183,8 +214,9 @@ impl LifecycleOutbox {
             inner: Some(Arc::new(OutboxInner {
                 path,
                 webhook,
-                sender,
+                sender: Mutex::new(Some(sender)),
                 receiver: Mutex::new(Some(receiver)),
+                writer_report: Mutex::new(None),
                 writer_spawned: AtomicBool::new(false),
                 spawn_lock: Mutex::new(()),
                 webhook_slots: Arc::new(Semaphore::new(WEBHOOK_MAX_IN_FLIGHT)),
@@ -258,20 +290,100 @@ impl LifecycleOutbox {
     /// append its own ends) and again from a terminating-signal handler
     /// (reason `"signal:SIGTERM"` etc. — the graceful-shutdown path).
     /// A disabled outbox is a no-op returning 0.
+    ///
+    /// Unbounded: the boot path may scan the whole file. A wedged or
+    /// contended outbox here waits on the lock indefinitely; use
+    /// [`Self::reconcile_interrupted_turns_bounded`] on the terminating-
+    /// signal path, where the exit must stay reachable.
     pub fn reconcile_interrupted_turns(&self, thread_id: &str, reason: &str) -> Result<usize> {
         let Some(inner) = self.inner.clone() else {
             return Ok(0);
         };
         inner.reconcile_interrupted_turns(thread_id, reason)
     }
+
+    /// [`Self::reconcile_interrupted_turns`] with a total time budget across
+    /// the lock wait, the scan, and the synthetic appends. When the budget
+    /// expires the reconciliation stops where it is: anything already
+    /// repaired stays repaired (the scan is idempotent, so a later
+    /// reconciliation — boot or signal — finishes the job), and the caller
+    /// can exit. This is the terminating-signal variant; the signal handler
+    /// must never wait unbounded on a contended outbox.
+    pub fn reconcile_interrupted_turns_bounded(
+        &self,
+        thread_id: &str,
+        reason: &str,
+        timeout: std::time::Duration,
+    ) -> Result<usize> {
+        let Some(inner) = self.inner.clone() else {
+            return Ok(0);
+        };
+        inner.reconcile_interrupted_turns_bounded(thread_id, reason, timeout)
+    }
+
+    /// Close the outbox queue: further [`Self::emit`]s are dropped with a
+    /// warning and the writer task drains whatever is still queued, then
+    /// exits. Idempotent. This is the deterministic shutdown entry point;
+    /// pair it with [`Self::flush_blocking`] (no runtime needed) or
+    /// [`Self::flush`] (async context).
+    pub fn close(&self) {
+        let Some(inner) = self.inner.clone() else {
+            return;
+        };
+        inner.close();
+    }
+
+    /// Blocking, bounded exit flush: close the queue, then wait until the
+    /// writer reports completion of every queued event (or the timeout
+    /// expires). Safe to call with no tokio runtime; on a multi-thread
+    /// runtime the writer drains concurrently while this busy-waits. The
+    /// returned report carries how many queued events were appended.
+    pub fn flush_blocking(&self, timeout: std::time::Duration) -> OutboxFlushReport {
+        let Some(inner) = self.inner.clone() else {
+            return OutboxFlushReport {
+                drained: true,
+                appended: 0,
+            };
+        };
+        inner.flush_blocking(timeout)
+    }
+
+    /// Async exit flush with the same contract as [`Self::flush_blocking`],
+    /// for callers already on a tokio runtime (the writer task can then
+    /// progress without busy-waiting).
+    pub async fn flush(&self, timeout: std::time::Duration) -> OutboxFlushReport {
+        let Some(inner) = self.inner.clone() else {
+            return OutboxFlushReport {
+                drained: true,
+                appended: 0,
+            };
+        };
+        inner.flush(timeout).await
+    }
+}
+
+/// Receipt of a bounded exit flush: whether every queued event was appended
+/// before the deadline, and how many were appended in this process's writer.
+pub struct OutboxFlushReport {
+    /// Every event enqueued before `close()` was attempted by the writer
+    /// before the deadline. (`false` means the timeout fired with events
+    /// still queued; the boot reconciliation is the backstop.)
+    pub drained: bool,
+    /// Events appended by this process's writer since it started.
+    pub appended: u64,
 }
 
 struct OutboxInner {
     path: PathBuf,
     webhook: Option<WebhookHookSink>,
-    sender: UnboundedSender<LifecycleEvent>,
+    /// The queue's send half. `None` after [`OutboxInner::close`], which also
+    /// closes the channel once the last sender clone is gone.
+    sender: Mutex<Option<UnboundedSender<LifecycleEvent>>>,
     /// The writer task's receive half. Taken exactly once by the writer task.
     receiver: Mutex<Option<UnboundedReceiver<LifecycleEvent>>>,
+    /// The writer task's completion receipt: the count of appended events,
+    /// sent when the writer exits after the queue is closed and drained.
+    writer_report: Mutex<Option<tokio::sync::oneshot::Receiver<u64>>>,
     writer_spawned: AtomicBool,
     /// Serializes the lazy writer-task spawn so two racing first emits cannot
     /// start two writers.
@@ -291,14 +403,118 @@ impl OutboxInner {
     /// Ordering: `send` happens before the spawn so events queued before the
     /// writer starts are drained first, preserving enqueue order.
     fn enqueue(self: &Arc<Self>, event: LifecycleEvent) -> Result<()> {
+        let sender = {
+            let guard = self
+                .sender
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match guard.as_ref() {
+                Some(sender) => sender.clone(),
+                None => return Err(anyhow::anyhow!("lifecycle outbox is closed")),
+            }
+        };
         self.pending.fetch_add(1, Ordering::AcqRel);
-        if self.sender.send(event).is_err() {
+        if sender.send(event).is_err() {
             // The writer task is gone; nothing will ever drain this event.
             self.pending.fetch_sub(1, Ordering::AcqRel);
             return Err(anyhow::anyhow!("lifecycle outbox writer task is gone"));
         }
         self.ensure_writer_spawned();
         Ok(())
+    }
+
+    /// Close the queue: drop the send half so the writer drains and exits.
+    /// Idempotent; emits after this are rejected in [`OutboxInner::enqueue`].
+    fn close(&self) {
+        self.sender
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+    }
+
+    fn flush_blocking(&self, timeout: std::time::Duration) -> OutboxFlushReport {
+        self.close();
+        let deadline = std::time::Instant::now() + timeout;
+        let report = self
+            .writer_report
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        loop {
+            if self.pending.load(Ordering::Acquire) == 0 {
+                // Every enqueued event's append attempt completed (the writer
+                // decrements only after `deliver` returns). Collect the
+                // writer's completion receipt if one exists; it is sent right
+                // after the queue drains and the channel closes.
+                let mut appended = 0u64;
+                if let Some(mut report) = report {
+                    loop {
+                        match report.try_recv() {
+                            Ok(count) => {
+                                appended = count;
+                                break;
+                            }
+                            Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                                if std::time::Instant::now() >= deadline {
+                                    break;
+                                }
+                                std::thread::sleep(RECONCILE_DRAIN_POLL);
+                            }
+                            // The writer never spawned (no runtime) or
+                            // exited without reporting; `pending == 0` is
+                            // the truth for completion here.
+                            Err(tokio::sync::oneshot::error::TryRecvError::Closed) => break,
+                        }
+                    }
+                }
+                return OutboxFlushReport {
+                    drained: true,
+                    appended,
+                };
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    target: "lifecycle_outbox",
+                    pending = self.pending.load(Ordering::Acquire),
+                    "lifecycle outbox did not drain within the exit-flush deadline; events may be lost"
+                );
+                return OutboxFlushReport {
+                    drained: false,
+                    appended: 0,
+                };
+            }
+            std::thread::sleep(RECONCILE_DRAIN_POLL);
+        }
+    }
+
+    async fn flush(&self, timeout: std::time::Duration) -> OutboxFlushReport {
+        self.close();
+        let drained = tokio::time::timeout(timeout, async {
+            while self.pending.load(Ordering::Acquire) > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let appended = if drained {
+            let report = self
+                .writer_report
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take();
+            match report {
+                Some(report) => report.await.unwrap_or(0),
+                None => 0,
+            }
+        } else {
+            tracing::warn!(
+                target: "lifecycle_outbox",
+                pending = self.pending.load(Ordering::Acquire),
+                "lifecycle outbox did not drain within the exit-flush deadline; events may be lost"
+            );
+            0
+        };
+        OutboxFlushReport { drained, appended }
     }
 
     fn ensure_writer_spawned(self: &Arc<Self>) {
@@ -327,12 +543,21 @@ impl OutboxInner {
         let Some(receiver) = receiver else {
             return;
         };
+        // Completion receipt: the writer sends the appended count when it
+        // exits, so the bounded exit flush can prove the queue drained
+        // instead of merely observing an empty counter.
+        let (report_tx, report_rx) = tokio::sync::oneshot::channel();
+        *self
+            .writer_report
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(report_rx);
         let mut state = WriterState {
             path: self.path.clone(),
             webhook: self.webhook.clone(),
             webhook_slots: self.webhook_slots.clone(),
             pending: self.pending.clone(),
             receiver,
+            report_tx: Some(report_tx),
         };
         self.writer_spawned.store(true, Ordering::Release);
         handle.spawn(async move {
@@ -346,7 +571,26 @@ impl OutboxInner {
         if thread_id.is_empty() {
             return Ok(0);
         }
-        reconcile_interrupted_turns_under_lock(&self.path, thread_id, reason)
+        reconcile_interrupted_turns_under_lock(&self.path, thread_id, reason, None)
+    }
+
+    /// See [`LifecycleOutbox::reconcile_interrupted_turns_bounded`].
+    fn reconcile_interrupted_turns_bounded(
+        &self,
+        thread_id: &str,
+        reason: &str,
+        timeout: std::time::Duration,
+    ) -> Result<usize> {
+        self.wait_for_pending_drain();
+        if thread_id.is_empty() {
+            return Ok(0);
+        }
+        reconcile_interrupted_turns_under_lock(
+            &self.path,
+            thread_id,
+            reason,
+            Some(std::time::Instant::now() + timeout),
+        )
     }
 
     /// Wait (bounded) for this process's own queued events to be appended so
@@ -381,23 +625,33 @@ struct WriterState {
     /// the synchronous paths can observe a drained queue.
     pending: Arc<AtomicUsize>,
     receiver: UnboundedReceiver<LifecycleEvent>,
+    /// Completion receipt send half; fired with the appended count when the
+    /// drain loop exits.
+    report_tx: Option<tokio::sync::oneshot::Sender<u64>>,
 }
 
 impl WriterState {
     /// Drain the queue until every sender is dropped, then exit.
     async fn run(&mut self) {
+        let mut appended = 0u64;
         while let Some(event) = self.receiver.recv().await {
-            if let Err(error) = self.deliver(event).await {
-                tracing::warn!(
-                    target: "lifecycle_outbox",
-                    %error,
-                    path = %self.path.display(),
-                    "lifecycle outbox write failed"
-                );
+            match self.deliver(event).await {
+                Ok(()) => appended += 1,
+                Err(error) => {
+                    tracing::warn!(
+                        target: "lifecycle_outbox",
+                        %error,
+                        path = %self.path.display(),
+                        "lifecycle outbox write failed"
+                    );
+                }
             }
             // The append attempt is complete either way; the synchronous
             // paths' drain wait observes the queue shrinking here.
             self.pending.fetch_sub(1, Ordering::AcqRel);
+        }
+        if let Some(report) = self.report_tx.take() {
+            let _ = report.send(appended);
         }
     }
 
@@ -518,6 +772,14 @@ fn write_envelope_line(
     envelope: &RuntimeEventEnvelope,
 ) -> Result<()> {
     let line = serde_json::to_string(envelope).context("failed to encode outbox event")?;
+    if line.len() as u64 + 1 > MAX_OUTBOX_LINE_BYTES {
+        anyhow::bail!(
+            "outbox envelope is {} bytes; refusing to append a line above the \
+             {MAX_OUTBOX_LINE_BYTES}-byte bound (the {SEQ_RECOVERY_TAIL_BYTES}-byte \
+             recovery window must always contain a complete line)",
+            line.len() + 1
+        );
+    }
     let mut record = Vec::with_capacity(line.len() + 1);
     record.extend_from_slice(line.as_bytes());
     record.push(b'\n');
@@ -540,32 +802,62 @@ fn write_envelope_line(
 /// and no `turn_end` for a turn. A turn with duplicate starts can never
 /// satisfy a 1:1 pairing consumer no matter what is appended, so it is left
 /// alone with a warning.
+///
+/// `deadline`: `None` runs the boot path unbounded (a whole-file scan is
+/// correct there). `Some(instant)` is the terminating-signal budget: the lock
+/// wait, the scan, and each synthetic append all check it, so a wedged or
+/// contended outbox can never trap the exit. When the budget expires the
+/// reconciliation stops where it is; anything left unpaired is still covered
+/// by the next boot (the mechanism is idempotent).
 fn reconcile_interrupted_turns_under_lock(
     path: &Path,
     thread_id: &str,
     reason: &str,
+    deadline: Option<std::time::Instant>,
 ) -> Result<usize> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)
             .with_context(|| format!("failed to create outbox directory {}", parent.display()))?;
     }
-    let _lock = OutboxFileLock::acquire(path)?;
+    let _lock = match deadline {
+        Some(deadline) => OutboxFileLock::acquire_bounded(path, deadline),
+        None => OutboxFileLock::acquire(path),
+    }?;
+
+    let deadline_passed = || deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline);
 
     // The lock excludes every cooperating writer, so this snapshot is stable
     // for the whole scan + append sequence below.
     let mut starts: std::collections::HashMap<String, usize> = Default::default();
     let mut ends: std::collections::HashMap<String, usize> = Default::default();
     let mut workspaces: std::collections::HashMap<String, Value> = Default::default();
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            for line in text.lines() {
+    match std::fs::File::open(path) {
+        Ok(file) => {
+            use std::io::BufRead;
+            for line in std::io::BufReader::new(file).lines() {
+                if deadline_passed() {
+                    tracing::warn!(
+                        target: "lifecycle_outbox",
+                        "reconciliation scan budget exhausted; stopping early (the next \
+                         boot continues the repair)"
+                    );
+                    break;
+                }
+                let Ok(line) = line else {
+                    tracing::debug!(
+                        target: "lifecycle_outbox",
+                        "skipping unreadable outbox line during reconciliation"
+                    );
+                    continue;
+                };
                 let line = line.trim();
                 if line.is_empty() {
                     continue;
                 }
                 let Ok(envelope) = serde_json::from_str::<RuntimeEventEnvelope>(line) else {
                     // A torn trailing line from a crash mid-append. It cannot
-                    // pair with anything; skip it.
+                    // pair with anything; skip it (the append path repairs it
+                    // under the lock before the next write).
                     tracing::debug!(
                         target: "lifecycle_outbox",
                         "skipping unparseable outbox line during reconciliation"
@@ -615,6 +907,14 @@ fn reconcile_interrupted_turns_under_lock(
 
     let mut reconciled = 0usize;
     for (turn_id, starts) in starts {
+        if deadline_passed() {
+            tracing::warn!(
+                target: "lifecycle_outbox",
+                "reconciliation budget exhausted before all synthetic ends were appended; \
+                 the next boot continues the repair"
+            );
+            break;
+        }
         let ends = ends.get(&turn_id).copied().unwrap_or(0);
         if starts == 1 && ends == 0 {
             let envelope = build_envelope(
@@ -683,6 +983,31 @@ impl OutboxFileLock {
             .with_context(|| format!("failed to lock outbox {}", lock_path.display()))?;
         Ok(Self { _file: file })
     }
+
+    /// [`OutboxFileLock::acquire`] with a hard deadline: the lock wait gives
+    /// up and errors once `deadline` passes. Used by the terminating-signal
+    /// reconciliation, where the exit must stay reachable even when another
+    /// writer is wedged holding the lock.
+    fn acquire_bounded(outbox_path: &Path, deadline: std::time::Instant) -> Result<Self> {
+        let lock_path = outbox_lock_path(outbox_path);
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
+            .open(&lock_path)
+            .with_context(|| format!("failed to open outbox lock {}", lock_path.display()))?;
+        lock_file_exclusive_bounded(&file, deadline).with_context(|| {
+            format!(
+                "failed to lock outbox {} before the deadline",
+                lock_path.display()
+            )
+        })?;
+        Ok(Self { _file: file })
+    }
 }
 
 /// `<outbox>.lock` — a sibling sidecar that holds no data. It is never
@@ -692,6 +1017,40 @@ fn outbox_lock_path(outbox_path: &Path) -> PathBuf {
     let mut name = outbox_path.as_os_str().to_owned();
     name.push(".lock");
     PathBuf::from(name)
+}
+
+/// Try for the outbox's exclusive lock until `deadline`, then fail. This is
+/// the terminating-signal variant of [`lock_file_exclusive`]: the signal
+/// flush must never wait unbounded on a wedged or contended writer, so the
+/// caller gets a hard stop and can exit (the next boot's reconciliation is
+/// the backstop).
+#[cfg(unix)]
+fn lock_file_exclusive_bounded(
+    file: &std::fs::File,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    use rustix::fs::{FlockOperation, flock};
+    use rustix::io::Errno;
+    use std::os::unix::io::AsFd;
+
+    loop {
+        match flock(file.as_fd(), FlockOperation::NonBlockingLockExclusive) {
+            Ok(()) => return Ok(()),
+            Err(Errno::WOULDBLOCK) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "timed out waiting for the outbox lock",
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            Err(Errno::INTR) => continue,
+            Err(error) => {
+                return Err(std::io::Error::from_raw_os_error(error.raw_os_error()));
+            }
+        }
+    }
 }
 
 /// Block until this process holds an exclusive advisory lock on `file`.
@@ -717,6 +1076,49 @@ fn lock_file_exclusive(file: &std::fs::File) -> std::io::Result<()> {
                 return Err(std::io::Error::from_raw_os_error(error.raw_os_error()));
             }
         }
+    }
+}
+
+/// Try for the outbox's exclusive lock until `deadline`, then fail; the
+/// Windows sibling of the bounded `flock` wait above.
+#[cfg(windows)]
+fn lock_file_exclusive_bounded(
+    file: &std::fs::File,
+    deadline: std::time::Instant,
+) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION;
+    use windows_sys::Win32::Storage::FileSystem::{
+        LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY, LockFileEx,
+    };
+
+    loop {
+        let mut overlapped =
+            std::mem::MaybeUninit::<windows_sys::Win32::System::IO::OVERLAPPED>::zeroed();
+        let result = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as _,
+                LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
+                0,
+                u32::MAX,
+                u32::MAX,
+                overlapped.as_mut_ptr(),
+            )
+        };
+        if result != 0 {
+            return Ok(());
+        }
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() != Some(ERROR_LOCK_VIOLATION as i32) {
+            return Err(error);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WouldBlock,
+                "timed out waiting for the outbox lock",
+            ));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
     }
 }
 
@@ -764,10 +1166,15 @@ fn lock_file_exclusive(file: &std::fs::File) -> std::io::Result<()> {
 ///
 /// Only the tail of the file is read (bounded by [`SEQ_RECOVERY_TAIL_BYTES`]);
 /// outbox lines are bounded far below that window, so the last complete line
-/// is always within it. A partial trailing line from a crash mid-write is
-/// ignored (the previous newline-terminated line wins). The caller must hold
-/// the outbox's exclusive lock, so the read cannot race another writer's
-/// append.
+/// is always within it.
+///
+/// **Torn-tail repair**: a partial trailing line from a crash mid-write is not
+/// merely ignored — it is truncated away under the caller's lock. Without
+/// this, the next O_APPEND write would land at the original EOF and fuse the
+/// torn JSON with the new envelope into one unparseable line, wedging the
+/// file. After the repair the file ends exactly at the last complete line and
+/// every subsequent append (and every reader) sees only complete lines. The
+/// caller must hold the outbox's exclusive lock.
 fn recover_last_seq(file: &mut std::fs::File, path: &Path) -> Result<u64> {
     let len = file
         .metadata()
@@ -783,29 +1190,46 @@ fn recover_last_seq(file: &mut std::fs::File, path: &Path) -> Result<u64> {
     file.read_exact(&mut tail)
         .with_context(|| format!("failed to read outbox {}", path.display()))?;
 
-    let line = match tail.iter().rposition(|byte| *byte == b'\n') {
-        // The bytes after the final newline are a torn trailing line from a
-        // crash mid-write; drop them. What remains ends at a newline, so the
-        // last complete line is the bytes after the previous newline.
+    match tail.iter().rposition(|byte| *byte == b'\n') {
         Some(last_nl) => {
+            // The bytes after the final newline are a torn trailing line from
+            // a crash mid-write; truncate them away so the next append starts
+            // a fresh line right after the last complete one.
+            let complete_end = start + last_nl as u64 + 1;
+            if complete_end < len {
+                file.set_len(complete_end).with_context(|| {
+                    format!("failed to truncate torn outbox tail {}", path.display())
+                })?;
+            }
             let body = &tail[..last_nl];
-            match body.iter().rposition(|byte| *byte == b'\n') {
+            let line = match body.iter().rposition(|byte| *byte == b'\n') {
                 Some(idx) => &body[idx + 1..],
                 None => body,
+            };
+            let line = std::str::from_utf8(line).context("outbox tail is not UTF-8")?;
+            if line.trim().is_empty() {
+                return Ok(1);
             }
+            let envelope: RuntimeEventEnvelope =
+                serde_json::from_str(line).context("failed to parse last outbox line")?;
+            Ok(envelope.seq.saturating_add(1))
         }
-        // No newline at all: no complete line inside this tail (a line can
-        // only exceed the tail window by violating the bounded-line
-        // invariant). Treat the file as not-yet-writable.
-        None => return Ok(1),
-    };
-    let line = std::str::from_utf8(line).context("outbox tail is not UTF-8")?;
-    if line.trim().is_empty() {
-        return Ok(1);
+        None if start == 0 => {
+            // No newline anywhere in the file: the whole file is one torn
+            // line (a complete line cannot exceed the tail window by the
+            // bounded-line invariant). Truncate it away and start fresh.
+            file.set_len(0)
+                .with_context(|| format!("failed to truncate torn outbox {}", path.display()))?;
+            Ok(1)
+        }
+        None => {
+            anyhow::bail!(
+                "outbox {} has no complete line within the last {SEQ_RECOVERY_TAIL_BYTES} bytes \
+                 (the bounded-line invariant is broken); refusing to append over it",
+                path.display()
+            );
+        }
     }
-    let envelope: RuntimeEventEnvelope =
-        serde_json::from_str(line).context("failed to parse last outbox line")?;
-    Ok(envelope.seq.saturating_add(1))
 }
 
 /// Bound free-form text to at most `max_chars` characters, stripping control
@@ -930,6 +1354,7 @@ mod tests {
             webhook_slots: Arc::new(Semaphore::new(WEBHOOK_MAX_IN_FLIGHT)),
             pending: Arc::new(AtomicUsize::new(0)),
             receiver: tokio::sync::mpsc::unbounded_channel().1,
+            report_tx: None,
         }
     }
 
@@ -1152,21 +1577,32 @@ mod tests {
     }
 
     #[test]
-    fn partial_trailing_line_is_ignored_during_recovery() {
+    fn partial_trailing_line_is_repaired_during_recovery() {
         let (_dir, path) = temp_outbox_path("partial.jsonl");
+        let line1 = r#"{"schema_version":1,"seq":1,"event":"session_start","kind":"session.started","thread_id":"s","turn_id":null,"item_id":null,"timestamp":"t","payload":{}}"#;
+        let line2 = r#"{"schema_version":1,"seq":2,"event":"turn_start","kind":"turn.started","thread_id":"s","turn_id":null,"item_id":null,"timestamp":"t","payload":{}}"#;
         std::fs::write(
             &path,
-            format!(
-                "{}\n{}\n{{\"schema_version\":1,\"seq\":3,\"event\":\"turn_",
-                r#"{"schema_version":1,"seq":1,"event":"session_start","kind":"session.started","thread_id":"s","turn_id":null,"item_id":null,"timestamp":"t","payload":{}}"#,
-                r#"{"schema_version":1,"seq":2,"event":"turn_start","kind":"turn.started","thread_id":"s","turn_id":null,"item_id":null,"timestamp":"t","payload":{}}"#,
-            ),
+            format!("{line1}\n{line2}\n{{\"schema_version\":1,\"seq\":3,\"event\":\"turn_"),
         )
         .expect("write partial outbox");
+
         // The torn trailing line is not a complete record; recovery continues
-        // from the last complete line's seq (2) → next seq 3.
-        let mut file = std::fs::File::open(&path).expect("open outbox");
+        // from the last complete line's seq (2) → next seq 3, and the torn
+        // bytes are truncated away so the next O_APPEND starts a fresh line.
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open outbox");
         assert_eq!(recover_last_seq(&mut file, &path).expect("recover"), 3);
+        let repaired = std::fs::read_to_string(&path).expect("read repaired");
+        assert_eq!(repaired, format!("{line1}\n{line2}\n"));
+        // Every line parses after the repair (the reviewer contract:
+        // seed torn tail → append → parse every line).
+        for line in repaired.lines() {
+            serde_json::from_str::<Value>(line).expect("complete json line");
+        }
     }
 
     #[tokio::test]
@@ -1721,5 +2157,185 @@ mod tests {
             WEBHOOK_MAX_IN_FLIGHT,
             "only the in-flight slots may be delivered; the rest are dropped"
         );
+    }
+
+    /// The reviewer contract for torn tails: seed a torn trailing line →
+    /// append → every line in the file parses → reopen the outbox (a fresh
+    /// handle, as a restarted process would) → append again. Both appends
+    /// land as complete lines and the seqs stay monotonic.
+    #[test]
+    fn torn_tail_is_repaired_before_append_and_survives_a_reopen() {
+        let (_dir, path) = temp_outbox_path("torn-contract.jsonl");
+        let line1 = r#"{"schema_version":1,"seq":1,"event":"session_start","kind":"session.started","thread_id":"s","turn_id":null,"item_id":null,"timestamp":"t","payload":{}}"#;
+        std::fs::write(
+            &path,
+            format!("{line1}\n{{\"schema_version\":1,\"seq\":2,\"event\":\"turn_"),
+        )
+        .expect("seed torn tail");
+
+        let outbox = LifecycleOutbox::new(Some(path.clone()), None, None);
+        let envelope = outbox
+            .emit_blocking(event("turn_start", "turn.started"))
+            .expect("first append after torn tail");
+        assert_eq!(envelope.seq, 2, "seq continues from the complete line");
+
+        let text = std::fs::read_to_string(&path).expect("read outbox");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "the torn tail was truncated away");
+        for line in &lines {
+            serde_json::from_str::<Value>(line).expect("every line parses");
+        }
+        // The line count proves the truncation: the torn fragment is gone and
+        // the new envelope is a separate, complete line (no fused record).
+
+        // Reopen: a fresh handle (new process) recovers the same seq and
+        // appends a third complete line.
+        let reopened = LifecycleOutbox::new(Some(path.clone()), None, None);
+        let envelope = reopened
+            .emit_blocking(event("turn_end", "turn.completed"))
+            .expect("append after reopen");
+        assert_eq!(envelope.seq, 3);
+        let text = std::fs::read_to_string(&path).expect("read outbox");
+        assert_eq!(text.lines().count(), 3);
+        for line in text.lines() {
+            serde_json::from_str::<Value>(line).expect("every line still parses");
+        }
+    }
+
+    /// A file that is nothing but one torn line (no newline anywhere, shorter
+    /// than the recovery window) is truncated to empty before the first
+    /// append, which then starts at seq 1.
+    #[test]
+    fn all_torn_file_is_truncated_and_restarts_at_seq_one() {
+        let (_dir, path) = temp_outbox_path("all-torn.jsonl");
+        std::fs::write(&path, "{\"schema_version\":1,\"seq\":1,\"event\":\"turn_")
+            .expect("seed all-torn file");
+        let outbox = LifecycleOutbox::new(Some(path.clone()), None, None);
+        let envelope = outbox
+            .emit_blocking(event("turn_start", "turn.started"))
+            .expect("append over all-torn file");
+        assert_eq!(envelope.seq, 1);
+        let text = std::fs::read_to_string(&path).expect("read outbox");
+        assert_eq!(text.lines().count(), 1);
+        serde_json::from_str::<Value>(text.lines().next().expect("one line"))
+            .expect("the only line parses");
+    }
+
+    /// The documented recovery invariant is enforced mechanically: a
+    /// serialized envelope above the line ceiling is refused (dropped, not
+    /// appended), so the file can never lose the last complete line out of
+    /// the recovery window.
+    #[test]
+    fn oversized_envelope_is_refused_so_the_recovery_window_stays_reachable() {
+        let (_dir, path) = temp_outbox_path("oversized.jsonl");
+        let outbox = LifecycleOutbox::new(Some(path.clone()), None, None);
+        let mut oversized = event("turn_start", "turn.started");
+        oversized.payload = json!({ "blob": "x".repeat(MAX_OUTBOX_LINE_BYTES as usize + 1024) });
+        let error = match outbox.emit_blocking(oversized) {
+            Ok(_) => panic!("oversized envelope must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("refusing to append"),
+            "error names the bound: {error}"
+        );
+        // The file stays healthy: next append is a normal line at seq 1.
+        let envelope = outbox
+            .emit_blocking(event("session_start", "session.started"))
+            .expect("append after refusal");
+        assert_eq!(envelope.seq, 1);
+        let text = std::fs::read_to_string(&path).expect("read outbox");
+        assert_eq!(text.lines().count(), 1);
+    }
+
+    /// Lock contention: while another holder keeps the exclusive lock, the
+    /// bounded acquire fails at its deadline; once released, it succeeds.
+    /// This is the guarantee the terminating-signal flush relies on — a
+    /// wedged writer cannot trap the exit.
+    #[test]
+    fn bounded_lock_acquire_times_out_under_contention_and_succeeds_after() {
+        let (_dir, path) = temp_outbox_path("contended.jsonl");
+        let holder = OutboxFileLock::acquire(&path).expect("holder takes the lock");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(120);
+        let started = std::time::Instant::now();
+        let error = match OutboxFileLock::acquire_bounded(&path, deadline) {
+            Ok(_) => panic!("bounded acquire must fail while the lock is held"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("before the deadline"),
+            "error names the deadline: {error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "the bounded acquire gave up near its deadline, not unbounded"
+        );
+        drop(holder);
+        OutboxFileLock::acquire_bounded(
+            &path,
+            std::time::Instant::now() + std::time::Duration::from_secs(2),
+        )
+        .expect("bounded acquire succeeds once the lock is free");
+    }
+
+    /// The bounded reconciliation budget: a contended lock fails at the
+    /// deadline instead of blocking the exit; the unbounded boot path still
+    /// repairs the turn once the holder is gone.
+    #[test]
+    fn bounded_reconcile_stops_at_the_deadline_and_boot_reconcile_repairs() {
+        let (_dir, path) = temp_outbox_path("reconcile-budget.jsonl");
+        let outbox = LifecycleOutbox::new(Some(path.clone()), None, None);
+        let mut start = event("turn_start", "turn.started");
+        start.thread_id = "killed-session".to_string();
+        start.turn_id = Some("open-turn".to_string());
+        outbox.emit_blocking(start).expect("seed unpaired start");
+
+        let holder = OutboxFileLock::acquire(&path).expect("holder takes the lock");
+        let error = match outbox.reconcile_interrupted_turns_bounded(
+            "killed-session",
+            "signal:SIGTERM",
+            std::time::Duration::from_millis(120),
+        ) {
+            Ok(_) => panic!("budgeted reconcile must fail fast under lock contention"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("before the deadline"),
+            "error names the deadline: {error}"
+        );
+        drop(holder);
+
+        let reconciled = outbox
+            .reconcile_interrupted_turns("killed-session", "boot_reconciliation")
+            .expect("boot reconcile after release");
+        assert_eq!(reconciled, 1, "the unpaired start is repaired");
+        let lines = read_lines_blocking(&path);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[1]["event"], "turn_end");
+        assert_eq!(lines[1]["payload"]["reconciled"], true);
+    }
+
+    /// The exit flush drains the queue and returns the writer's completion
+    /// receipt; emits after close are dropped and the file stays settled.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn exit_flush_drains_and_reports_then_rejects_late_emits() {
+        let (_dir, path) = temp_outbox_path("flush.jsonl");
+        let outbox = LifecycleOutbox::new(Some(path.clone()), None, None);
+        outbox.emit(event("session_start", "session.started"));
+        outbox.emit(event("turn_start", "turn.started"));
+        outbox.emit(event("turn_end", "turn.completed"));
+
+        let report = outbox.flush_blocking(std::time::Duration::from_secs(5));
+        assert!(report.drained, "all queued events were appended");
+        assert_eq!(report.appended, 3, "the writer's receipt counts all three");
+        let lines = read_lines_blocking(&path);
+        assert_eq!(lines.len(), 3);
+
+        // The outbox is closed: a late emit is dropped, and another flush
+        // still reports a settled file.
+        outbox.emit(event("turn_end", "turn.completed"));
+        let report = outbox.flush_blocking(std::time::Duration::from_secs(5));
+        assert!(report.drained);
+        assert_eq!(read_lines_blocking(&path).len(), 3, "no late line landed");
     }
 }

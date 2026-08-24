@@ -3074,16 +3074,22 @@ impl Engine {
     }
 
     /// Thread id for engine-side outbox turn events. The interactive TUI
-    /// installs its hook executor on the engine config, so this is the same
-    /// hook session identity the TUI-side `session_start`/`session_end`/
-    /// subagent/stall events carry; engines without one (tests) fall back to
-    /// the engine session id.
+    /// resolves the stable per-surface outbox identity (persisted across
+    /// launches, so boot reconciliation can pair a killed prior session's
+    /// records); engines without a hook executor (tests, hosted engines)
+    /// fall back to the engine session id.
     fn outbox_thread_id(&self) -> String {
-        self.config
-            .hook_executor
-            .as_ref()
-            .map(|hooks| hooks.session_id().to_string())
-            .unwrap_or_else(|| self.session.id.clone())
+        if self.config.hook_executor.is_some() {
+            crate::outbox_identity::acquire("tui").unwrap_or_else(|| {
+                self.config
+                    .hook_executor
+                    .as_ref()
+                    .map(|hooks| hooks.session_id().to_string())
+                    .unwrap_or_else(|| self.session.id.clone())
+            })
+        } else {
+            self.session.id.clone()
+        }
     }
 
     async fn emit_session_updated(&self) {
@@ -4639,7 +4645,10 @@ impl Engine {
                         &model,
                         codewhale_hooks::OUTBOX_DETAIL_MAX_CHARS,
                     ),
-                    "workspace": self.session.workspace.display().to_string(),
+                    "workspace": codewhale_hooks::bounded_text(
+                    &self.session.workspace.display().to_string(),
+                    codewhale_hooks::OUTBOX_PATH_MAX_CHARS,
+                ),
                 }),
             });
         }
@@ -5058,7 +5067,10 @@ impl Engine {
                         .signed_duration_since(turn_started_at)
                         .num_milliseconds()
                         .max(0) as u64,
-                    "workspace": self.session.workspace.display().to_string(),
+                    "workspace": codewhale_hooks::bounded_text(
+                    &self.session.workspace.display().to_string(),
+                    codewhale_hooks::OUTBOX_PATH_MAX_CHARS,
+                ),
                     "error": error.as_deref().map(|message| codewhale_hooks::bounded_text(
                         message,
                         codewhale_hooks::OUTBOX_DETAIL_MAX_CHARS,

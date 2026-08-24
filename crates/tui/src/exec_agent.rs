@@ -13,6 +13,37 @@ pub(crate) fn exec_max_steps(max_turns: Option<u32>) -> u32 {
     max_turns.unwrap_or(crate::core::engine::DEFAULT_MAX_STEPS)
 }
 
+/// Bounded exit-flush guard for `codewhale exec`: dropping it (on every path
+/// out of the run — success, error, or an early `?` bail between the turn
+/// boundaries) closes the outbox queue and waits briefly for the writer to
+/// append what was queued. The wait is bounded and the process runs on a
+/// multi-thread runtime, so the writer drains concurrently; on a wedged
+/// writer the deadline fires and the next boot's reconciliation is the
+/// backstop.
+struct ExecOutboxFlushGuard {
+    outbox: codewhale_hooks::LifecycleOutbox,
+}
+
+impl ExecOutboxFlushGuard {
+    fn new(outbox: codewhale_hooks::LifecycleOutbox) -> Self {
+        Self { outbox }
+    }
+}
+
+impl Drop for ExecOutboxFlushGuard {
+    fn drop(&mut self) {
+        let report = self.outbox.flush_blocking(EXEC_OUTBOX_FLUSH_TIMEOUT);
+        if !report.drained {
+            tracing::warn!(
+                target: "lifecycle_outbox",
+                "exec outbox exit flush hit the deadline with events still queued"
+            );
+        }
+    }
+}
+
+const EXEC_OUTBOX_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn run_exec_agent(
     config: &Config,
@@ -374,6 +405,43 @@ pub(crate) async fn run_exec_agent(
             )
         })
         .unwrap_or_else(codewhale_hooks::LifecycleOutbox::disabled);
+    // Lifecycle outbox identity for headless runs: one stable thread id
+    // (the persisted per-surface `exec` identity, so a killed run's records
+    // are found by the next boot's reconciliation) and one turn id minted
+    // before dispatch, carried by both boundaries so a supervisor can pair
+    // `turn_start`/`turn_end` regardless of the engine's later session-id
+    // changes. With the outbox disabled the ids are never used.
+    let exec_outbox_thread_id = if lifecycle_outbox.is_enabled() {
+        crate::outbox_identity::acquire("exec")
+            .unwrap_or_else(|| format!("exec_{}", &uuid::Uuid::new_v4().to_string()[..8]))
+    } else {
+        String::new()
+    };
+    let exec_outbox_turn_id = format!("turn_{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    // Boot reconciliation: pair any `turn_start` a killed prior exec run
+    // left open (SIGKILL runs no code; catchable signals are covered by the
+    // registered flush below). No-op when disabled or the file is healthy.
+    if let Err(error) =
+        lifecycle_outbox.reconcile_interrupted_turns(&exec_outbox_thread_id, "boot_reconciliation")
+    {
+        tracing::warn!(
+            target: "lifecycle_outbox",
+            %error,
+            "exec boot reconciliation failed"
+        );
+    }
+    // Register the run's outbox identity for the terminating-signal path so
+    // a catchable signal mid-turn flushes the synthetic `turn_end` before
+    // the process dies.
+    crate::outbox_signal::register(
+        lifecycle_outbox.clone(),
+        exec_outbox_thread_id.clone(),
+    );
+    // Bounded deterministic exit flush: every path out of this function
+    // (success, error, early `?` bail between the boundaries) closes the
+    // queue and waits briefly for the writer to land what was queued.
+    let _exec_outbox_flush =
+        ExecOutboxFlushGuard::new(lifecycle_outbox.clone());
     // Wall clock for the outbox `turn_end` duration. `exec` never receives
     // a TurnStarted engine event, so the start is marked at the same
     // `Op::SendMessage` boundary where `turn_start` is emitted below.
@@ -418,11 +486,14 @@ pub(crate) async fn run_exec_agent(
     lifecycle_outbox.emit(codewhale_hooks::LifecycleEvent {
         event: "turn_start".to_string(),
         kind: "turn.started".to_string(),
-        thread_id: loaded_session_id.clone().unwrap_or_default(),
-        turn_id: None,
+        thread_id: exec_outbox_thread_id.clone(),
+        turn_id: Some(exec_outbox_turn_id.clone()),
         item_id: None,
         payload: serde_json::json!({
-            "workspace": workspace.display().to_string(),
+            "workspace": codewhale_hooks::bounded_text(
+                &workspace.display().to_string(),
+                codewhale_hooks::OUTBOX_PATH_MAX_CHARS,
+            ),
         }),
     });
 
@@ -823,13 +894,16 @@ pub(crate) async fn run_exec_agent(
                     lifecycle_outbox.emit(codewhale_hooks::LifecycleEvent {
                         event: "turn_end".to_string(),
                         kind: kind.to_string(),
-                        thread_id: latest_session_id.clone().unwrap_or_default(),
-                        turn_id: None,
+                        thread_id: exec_outbox_thread_id.clone(),
+                        turn_id: Some(exec_outbox_turn_id.clone()),
                         item_id: None,
                         payload: serde_json::json!({
                             "status": outbox_status,
                             "duration_ms": exec_turn_started_at.elapsed().as_millis() as u64,
-                            "workspace": latest_workspace.display().to_string(),
+                            "workspace": codewhale_hooks::bounded_text(
+                                &latest_workspace.display().to_string(),
+                                codewhale_hooks::OUTBOX_PATH_MAX_CHARS,
+                            ),
                             "error": summary.error.as_deref().map(|message| {
                                 codewhale_hooks::bounded_text(
                                     message,
@@ -1020,13 +1094,16 @@ pub(crate) async fn run_exec_agent(
         lifecycle_outbox.emit(codewhale_hooks::LifecycleEvent {
             event: "turn_end".to_string(),
             kind: "turn.failed".to_string(),
-            thread_id: latest_session_id.clone().unwrap_or_default(),
-            turn_id: None,
+            thread_id: exec_outbox_thread_id.clone(),
+            turn_id: Some(exec_outbox_turn_id.clone()),
             item_id: None,
             payload: serde_json::json!({
                 "status": "failed",
                 "duration_ms": exec_turn_started_at.elapsed().as_millis() as u64,
-                "workspace": latest_workspace.display().to_string(),
+                "workspace": codewhale_hooks::bounded_text(
+                    &latest_workspace.display().to_string(),
+                    codewhale_hooks::OUTBOX_PATH_MAX_CHARS,
+                ),
                 "error": codewhale_hooks::bounded_text(
                     &error,
                     codewhale_hooks::OUTBOX_DETAIL_MAX_CHARS,

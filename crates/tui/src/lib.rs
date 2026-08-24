@@ -82,6 +82,7 @@ mod models_dev_live;
 mod native_memory;
 mod network_policy;
 mod oauth;
+mod outbox_identity;
 mod outbox_signal;
 mod palette;
 mod plugins;

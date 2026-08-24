@@ -45,10 +45,12 @@ pub(crate) fn register(outbox: LifecycleOutbox, thread_id: String) {
 /// terminating-signal cleanup task before the process exits.
 ///
 /// `signal` is the human-readable signal name for the outbox payload
-/// (`SIGTERM`, `SIGHUP`, `SIGINT`). Blocking: appends run synchronously
-/// under the outbox lock, so the exit waits at most for the bounded queue
-/// drain plus the append itself. Nothing here can fail the exit — the flush
-/// logs and the signal path proceeds either way.
+/// (`SIGTERM`, `SIGHUP`, `SIGINT`). Blocking, but bounded end to end: the
+/// queue is closed first (the writer drains what was queued), then the
+/// reconciliation runs under a total lock+scan+append budget, so a wedged
+/// writer or a contended lock can never trap the exit. Nothing here can
+/// fail the exit — the flush logs and the signal path proceeds either way;
+/// the next boot's reconciliation is the backstop for whatever did not land.
 pub(crate) fn flush_open_turn_on_signal(signal: &str) {
     let Some((outbox, thread_id)) = context().lock().ok().and_then(|guard| guard.clone()) else {
         return;
@@ -56,8 +58,11 @@ pub(crate) fn flush_open_turn_on_signal(signal: &str) {
     if thread_id.is_empty() {
         return;
     }
+    // Close the queue: nothing new can be enqueued, the writer drains what
+    // is still queued, and the scan below sees the settled file.
+    outbox.close();
     let reason = format!("signal:{signal}");
-    match outbox.reconcile_interrupted_turns(&thread_id, &reason) {
+    match outbox.reconcile_interrupted_turns_bounded(&thread_id, &reason, SIGNAL_FLUSH_BUDGET) {
         Ok(0) => {}
         Ok(reconciled) => {
             tracing::info!(
@@ -80,11 +85,22 @@ pub(crate) fn flush_open_turn_on_signal(signal: &str) {
     }
 }
 
+/// Total budget for the whole terminating-signal flush (lock wait + scan +
+/// synthetic appends). The exit must stay reachable even when the outbox is
+/// contended or wedged: on expiry the flush stops where it is and the next
+/// boot's reconciliation finishes the repair.
+const SIGNAL_FLUSH_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use codewhale_hooks::{LifecycleEvent, LifecycleOutbox};
     use serde_json::json;
+
+    /// The signal registry is process-global; serialize the tests that touch
+    /// it so they cannot race each other (or sibling tests in this binary)
+    /// on the shared registry slot.
+    static SIGNAL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// The graceful-shutdown path: a registered session with an open turn
     /// (turn_start written, turn_end never) gets its synthetic end from the
@@ -93,6 +109,9 @@ mod tests {
     /// second flush must not duplicate the end.
     #[test]
     fn signal_flush_pairs_an_open_turn_and_does_not_duplicate() {
+        let _serial = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("signal-flush.jsonl");
         let outbox = LifecycleOutbox::new(Some(path.clone()), None, None);
@@ -136,6 +155,9 @@ mod tests {
     /// With no session registered, the flush is a silent no-op.
     #[test]
     fn signal_flush_is_a_noop_without_a_registered_session() {
+        let _serial = SIGNAL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // The registry is process-global and shared with the test above;
         // clear it so this test observes the unregistered state.
         if let Ok(mut guard) = context().lock() {

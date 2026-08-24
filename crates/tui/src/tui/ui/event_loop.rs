@@ -15,6 +15,11 @@ use crate::models::Role;
 
 use crate::tui::control_socket::SessionControl;
 
+/// Deadline for the lifecycle-outbox exit flush at TUI shutdown: the writer
+/// drains queued events on the runtime; the bound keeps a wedged writer from
+/// delaying terminal teardown (the boot reconciliation is the backstop).
+const TUI_OUTBOX_FLUSH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 pub(super) fn event_owner_is_active(
     current_session_id: Option<&str>,
     owner_session_id: &str,
@@ -504,6 +509,18 @@ pub async fn run_tui(
         Err(err) => tracing::warn!("could not mirror initial engine system prompt: {err:#}"),
     }
 
+    // Stable cross-process outbox identity: boot reconciliation pairs the
+    // prior process's records only when this launch emits under the same id
+    // the killed process used. The identity is persisted per surface and
+    // claimed for the session (a second live instance of the same surface
+    // falls back to an ephemeral id instead of sharing the pairing key).
+    // With the outbox disabled there is no identity and no reconciliation.
+    let outbox_thread_id = if app.lifecycle_outbox.is_enabled() {
+        crate::outbox_identity::acquire("tui").unwrap_or_else(|| app.hooks.session_id().to_string())
+    } else {
+        String::new()
+    };
+
     // Session ownership of outbox turn boundaries: before the first emit,
     // reconcile any `turn_start` this session left unpaired when a previous
     // process died mid-turn (SIGKILL, a closed pane — where no code could
@@ -513,7 +530,7 @@ pub async fn run_tui(
     // No-op when the outbox is disabled or the file is healthy.
     {
         let reconcile_outbox = app.lifecycle_outbox.clone();
-        let reconcile_thread_id = app.hooks.session_id().to_string();
+        let reconcile_thread_id = outbox_thread_id.clone();
         let reconcile_result = tokio::task::spawn_blocking(move || {
             reconcile_outbox
                 .reconcile_interrupted_turns(&reconcile_thread_id, "boot_reconciliation")
@@ -524,7 +541,7 @@ pub async fn run_tui(
             Ok(Ok(reconciled)) => {
                 tracing::info!(
                     target: "lifecycle_outbox",
-                    thread_id = %app.hooks.session_id(),
+                    thread_id = %outbox_thread_id,
                     reconciled,
                     "boot reconciliation appended synthetic turn_end(s) for interrupted turns"
                 );
@@ -532,7 +549,7 @@ pub async fn run_tui(
             Ok(Err(error)) => {
                 tracing::warn!(
                     target: "lifecycle_outbox",
-                    thread_id = %app.hooks.session_id(),
+                    thread_id = %outbox_thread_id,
                     %error,
                     "boot reconciliation failed"
                 );
@@ -550,9 +567,6 @@ pub async fn run_tui(
     // Fire session start hook
     {
         let context = app.base_hook_context();
-        // Captured before the hook executor moves `context` into its blocking
-        // task; the outbox emit below needs the same session identity.
-        let outbox_thread_id = context.session_id.clone().unwrap_or_default();
         // Register the session's outbox identity for the terminating-signal
         // path: a SIGTERM/SIGHUP later in the session flushes the open turn
         // through the same file-truth reconciliation as boot above.
@@ -569,20 +583,28 @@ pub async fn run_tui(
             app.status_message = Some("session_start hook executor did not run".to_string());
         }
         // Lifecycle outbox (`[lifecycle_outbox]`): fires alongside the
-        // session_start hook, with the same session identity. No-op when
+        // session_start hook, under the stable outbox identity. No-op when
         // the feature is disabled.
         app.lifecycle_outbox.emit(codewhale_hooks::LifecycleEvent {
             event: "session_start".to_string(),
             kind: "session.started".to_string(),
-            thread_id: outbox_thread_id,
+            thread_id: outbox_thread_id.clone(),
             turn_id: None,
             item_id: None,
             payload: serde_json::json!({
                 "mode": outbox_mode,
-                "model": outbox_model,
+                "model": outbox_model.map(|model| {
+                    codewhale_hooks::bounded_text(
+                        &model,
+                        codewhale_hooks::OUTBOX_DETAIL_MAX_CHARS,
+                    )
+                }),
                 "workspace": outbox_workspace
                     .as_ref()
-                    .map(|path| path.display().to_string()),
+                    .map(|path| codewhale_hooks::bounded_text(
+                        &path.display().to_string(),
+                        codewhale_hooks::OUTBOX_PATH_MAX_CHARS,
+                    )),
             }),
         });
     }
@@ -674,21 +696,38 @@ pub async fn run_tui(
         let context = app.base_hook_context();
         let _ = app.execute_hooks(HookEvent::SessionEnd, &context);
         // Lifecycle outbox (`[lifecycle_outbox]`): fires alongside the
-        // session_end hook, with the same session identity. No-op when
+        // session_end hook, under the stable outbox identity. No-op when
         // the feature is disabled.
         app.lifecycle_outbox.emit(codewhale_hooks::LifecycleEvent {
             event: "session_end".to_string(),
             kind: "session.ended".to_string(),
-            thread_id: context.session_id.clone().unwrap_or_default(),
+            thread_id: outbox_thread_id.clone(),
             turn_id: None,
             item_id: None,
             payload: serde_json::json!({
                 "workspace": context.workspace
                     .as_ref()
-                    .map(|path| path.display().to_string()),
+                    .map(|path| codewhale_hooks::bounded_text(
+                        &path.display().to_string(),
+                        codewhale_hooks::OUTBOX_PATH_MAX_CHARS,
+                    )),
                 "total_tokens": context.total_tokens,
             }),
         });
+    }
+
+    // Bounded deterministic exit flush: everything queued before this point
+    // is appended while the runtime is still up (the writer drains here; the
+    // deadline is the backstop, and the boot reconciliation covers a hard
+    // loss). No-op when the outbox is disabled.
+    {
+        let outbox_flush = app.lifecycle_outbox.flush(TUI_OUTBOX_FLUSH_TIMEOUT).await;
+        if !outbox_flush.drained {
+            tracing::warn!(
+                target: "lifecycle_outbox",
+                "lifecycle outbox exit flush hit the deadline with events still queued"
+            );
+        }
     }
 
     // Flush the persistence actor: clear this session's checkpoint, collect

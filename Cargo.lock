@@ -1110,6 +1110,7 @@ dependencies = [
  "rmcp",
  "rusqlite",
  "rust-i18n",
+ "rustix",
  "rustls",
  "schemars",
  "schemaui",

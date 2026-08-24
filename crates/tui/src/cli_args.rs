@@ -544,15 +544,26 @@ pub(crate) enum FleetAlertAdapterArg {
 /// terminated-by-signal exit (no code, no terminal restore, no `session_end`).
 /// After this function returns, the signals are armed.
 pub(crate) fn spawn_signal_cleanup_task() {
-    let signals = TerminatingSignals::register();
+    let mut signals = TerminatingSignals::register();
     tokio::spawn(async move {
+        // First fatal signal: run the cleanup below. The `Signal` streams
+        // stay registered (they live in `signals` for the task's lifetime),
+        // so a second signal is still caught — and, while the blocking
+        // cleanup runs, it bypasses the cleanup entirely: a second
+        // Ctrl+C/SIGTERM exits immediately instead of queueing behind a
+        // wedged outbox flush or a stuck session-store write.
         let exit_code = signals.wait().await;
-        // If we get here a fatal signal arrived. Restore the terminal
-        // and exit. A second signal during cleanup re-enters this
-        // path and aborts via `std::process::exit` directly.
         static CLEANED_UP: std::sync::atomic::AtomicBool =
             std::sync::atomic::AtomicBool::new(false);
-        if !CLEANED_UP.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        if CLEANED_UP.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            // Unreachable in the single-task structure, but the guard makes
+            // the idempotence local: cleanup at most once per process.
+            std::process::exit(exit_code);
+        }
+        // The cleanup is blocking (bounded outbox flush + a single
+        // `O_APPEND` session-store write); run it on the blocking pool so
+        // the second-signal `select!` below stays polled.
+        let cleanup = tokio::task::spawn_blocking(move || {
             #[cfg(unix)]
             crate::tools::shell::abort_pending_persistent_process_groups_for_exit();
             crate::tui::ui::emergency_restore_terminal();
@@ -561,7 +572,8 @@ pub(crate) fn spawn_signal_cleanup_task() {
             // flush derives the open turn from the outbox *file* under the
             // cross-process lock, so it cannot duplicate an end; a SIGKILL
             // skips this path entirely and the next boot's reconciliation
-            // covers it. Best effort: it logs and proceeds on failure.
+            // covers it. Best effort and bounded: it logs and proceeds on
+            // failure or deadline.
             crate::outbox_signal::flush_open_turn_on_signal(signal_name(exit_code));
             // Nothing async survives the `exit` below, so this is the last
             // chance to say how the session ended. `record_blocking` is one
@@ -574,6 +586,17 @@ pub(crate) fn spawn_signal_cleanup_task() {
             // also exits 130, so `exit_code` cannot tell a signal from an
             // Esc-cancelled turn.
             record_signal_session_end();
+        });
+        tokio::select! {
+            _ = signals.wait() => {
+                // A second signal arrived while the cleanup was still
+                // running: restore the terminal once more and exit
+                // immediately, so a stuck cleanup can never trap a
+                // frustrated user pressing Ctrl+C repeatedly.
+                crate::tui::ui::emergency_restore_terminal();
+                std::process::exit(exit_code);
+            }
+            _ = cleanup => {}
         }
         std::process::exit(exit_code);
     });
@@ -655,10 +678,13 @@ impl TerminatingSignals {
         }
     }
 
-    /// Resolve with 128 + signal number for whichever arrives first. The
-    /// fallback never-resolving future keeps `select!` well-typed when a
+    /// Resolve with 128 + signal number for whichever arrives first. Takes
+    /// `&mut self` (the `Signal` handles stay owned by the caller, so the
+    /// registrations survive) and can be awaited again for a subsequent
+    /// signal — each registered stream delivers one event per occurrence.
+    /// The fallback never-resolving future keeps `select!` well-typed when a
     /// stream failed to register.
-    async fn wait(mut self) -> i32 {
+    async fn wait(&mut self) -> i32 {
         tokio::select! {
             _ = async { match self.sigint.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await, } } => 130,
             _ = async { match self.sigterm.as_mut() { Some(s) => { s.recv().await; }, None => std::future::pending::<()>().await, } } => 143,
@@ -683,7 +709,7 @@ impl TerminatingSignals {
         }
     }
 
-    async fn wait(mut self) -> i32 {
+    async fn wait(&mut self) -> i32 {
         match self.ctrl_c.as_mut() {
             Some(s) => {
                 s.recv().await;

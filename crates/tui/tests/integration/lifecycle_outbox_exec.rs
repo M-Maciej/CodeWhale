@@ -486,7 +486,11 @@ async fn concurrent_exec_runs_interleave_cleanly_in_one_shared_outbox() {
     }
     assert_eq!(by_turn.len(), 2, "two runs, two distinct turn ids");
     for (turn_id, pair) in by_turn {
-        assert_eq!(pair.len(), 2, "turn {turn_id} has exactly one start and one end");
+        assert_eq!(
+            pair.len(),
+            2,
+            "turn {turn_id} has exactly one start and one end"
+        );
         let mut events: Vec<&str> = pair
             .iter()
             .map(|line| line["event"].as_str().expect("event"))

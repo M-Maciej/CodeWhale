@@ -433,15 +433,11 @@ pub(crate) async fn run_exec_agent(
     // Register the run's outbox identity for the terminating-signal path so
     // a catchable signal mid-turn flushes the synthetic `turn_end` before
     // the process dies.
-    crate::outbox_signal::register(
-        lifecycle_outbox.clone(),
-        exec_outbox_thread_id.clone(),
-    );
+    crate::outbox_signal::register(lifecycle_outbox.clone(), exec_outbox_thread_id.clone());
     // Bounded deterministic exit flush: every path out of this function
     // (success, error, early `?` bail between the boundaries) closes the
     // queue and waits briefly for the writer to land what was queued.
-    let _exec_outbox_flush =
-        ExecOutboxFlushGuard::new(lifecycle_outbox.clone());
+    let _exec_outbox_flush = ExecOutboxFlushGuard::new(lifecycle_outbox.clone());
     // Wall clock for the outbox `turn_end` duration. `exec` never receives
     // a TurnStarted engine event, so the start is marked at the same
     // `Op::SendMessage` boundary where `turn_start` is emitted below.

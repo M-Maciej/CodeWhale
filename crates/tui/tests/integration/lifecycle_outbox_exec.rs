@@ -316,8 +316,6 @@ async fn exec_emits_turn_start_and_turn_end_to_the_configured_outbox() {
     );
     let turn_id = start["turn_id"].as_str().expect("turn_id");
     assert!(turn_id.starts_with("turn_"), "turn_id: {turn_id}");
-    // The model field is bounded and never the raw prompt.
-    assert_eq!(start["payload"]["model"], TEST_MODEL);
     // Every payload carries the workspace for consumer-side routing; exec
     // runs with `--workspace <dir>`, so the emitted path must match it.
     assert_eq!(

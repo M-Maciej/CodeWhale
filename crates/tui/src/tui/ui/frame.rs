@@ -369,6 +369,19 @@ pub(crate) fn build_session_snapshot(
             app.system_prompt.as_ref(),
             Some(app.mode.as_setting()),
         )
+    } else if let Some(store_id) = app.store_session_id.clone() {
+        // Fresh boot with a per-session runtime store (#5630): adopt the boot
+        // id as the transcript id so `/relaunch` and `--resume` re-open the
+        // same store this process's managed threads live in.
+        create_saved_session_with_id_and_mode(
+            store_id,
+            &app.api_messages,
+            &model,
+            &app.workspace,
+            u64::from(app.session.total_tokens),
+            app.system_prompt.as_ref(),
+            Some(app.mode.as_setting()),
+        )
     } else {
         create_saved_session_with_mode(
             &app.api_messages,

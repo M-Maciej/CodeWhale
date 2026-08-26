@@ -9,17 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- Compaction keeps a bounded verbatim last round (latest user message plus
-  assistant/tool results) and refuses to replace history if that round would
-  vanish. The context inspector names the compaction path and `/anchor`
-  survival (#4394, T2).
+- Compaction now keeps a bounded verbatim last round (the latest user
+  message plus its assistant/tool results) instead of discarding every
+  assistant/tool/thinking turn behind a summary. A coverage floor refuses
+  to replace history if that last round would vanish. `/context` and the
+  inspector gained compaction and `/anchor` rows so a pass is visible
+  (#4394, IMPROVEMENT-PLAN-0912 T2).
+
 - Selected transcript blocks support `y` copy content, `Y` copy metadata,
   Enter fullscreen, and `r` raw markdown, only when an explicit selection
   exists so empty-composer typing is not stolen (#5551).
-- Added `/tutorial` (alias `/tour`, #5556): an opt-in pager that is never
-  shown automatically. The first page maps concepts for people arriving from
-  Claude Code, Cursor, or Codex; later pages cover keys, the composer, models,
-  Fleet, and workflows.
 - Optional per-session control socket (`[control_socket]` config table,
   Unix, off by default): when enabled, the interactive TUI binds a
   newline-framed JSON-RPC socket at `<sessions-dir>/<session-id>/control.sock`
@@ -48,6 +47,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   synthetic `turn_end` for open turns, and boot reconciliation pairs turns a
   SIGKILLed session left unpaired. Bounded preview/redaction rules apply to
   every field. Design record: `docs/rfcs/1365-lifecycle-outbox.md` (#5531).
+- Added the `computer-use` plugin bundle (`crates/computer-use/bundle/`) and the
+  `codewhale computer-use` subcommand backing it: a stdio MCP server
+  (`crates/computer-use`) that captures the screen and injects input on
+  macOS (CoreGraphics), Windows (GDI/SendInput), Linux and HarmonyOS PC
+  (`xdotool`/`grim` family), Android (`adb`), and HarmonyOS/OpenHarmony
+  (`hdc`/`uitest`). Built for `deepseek-v4-flash-vision-exp`: screenshots are
+  downscaled to the model's 384-token image budget, every action returns a
+  fresh screenshot, and `computer_zoom`/grid overlays recover fine detail.
+  The bundle also ships the `computer-use:computer-use` Skill, a
+  vision-pinned `computer-operator` Agent profile, and `/computer <task>`.
+  Install in one step with `codewhale computer-use setup` (writes the
+  embedded bundle, triggers the macOS permission prompts, runs a test
+  capture) or from the new built-in `official` marketplace catalog
+  (`/plugin marketplace install official computer-use`, backed by a new
+  `builtin:<name>` install source); trust and enablement stay in the
+  hash-bound review. The website's install page gained a matching section.
+  Operator guide: `docs/COMPUTER_USE.md`.
 - Composer attachments now render as a compact `[Image #1]` token instead of
   the full `[Attached image: 1920x1440 PNG (2.3MB) at /long/path.png]` line.
   This is display-only: the buffer still stores the path-bearing text, so
@@ -131,6 +147,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   facet and registrations declare least capabilities. `/loop` on this branch
   was adapted to the same `Contextual { capabilities, handler }` shape so
   the watcher command compiles with the new dispatcher.
+- Bare family aliases now track the current GA default: `glm-5` / `glm5` /
+  `zai-glm-5` resolve to `DEFAULT_ZAI_MODEL` (`GLM-5.3`), and `gpt-5` /
+  `gpt5` / `openai-gpt-5` resolve to `DEFAULT_OPENAI_MODEL` (`gpt-5.6`).
+  Explicit versioned ids (`GLM-5.2`, `gpt-5.5`, `gpt-5.6-sol`, …) stay
+  pinned. A catalog guard fails CI if a higher `GLM-5.<N>` or `gpt-5.<N>`
+  GA/sol row is added without bumping the matching default.
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
+
 - Provider neutrality (#5588): model resolution of omitted/aliased models is
   now provider-relative, OpenAI-native defaults no longer route through
   another provider's table, CLI credentials stay provider-scoped, NVIDIA
@@ -160,6 +189,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   still rejected by the credit gate.
 
 ### Fixed
+
+- Fixed the runtime thread store's process-owner lock becoming a
+  one-codewhale-per-machine guard (#5630): interactive sessions now default
+  their store root to `<sessions-dir>/<session-id>/runtime` — the session the
+  process owns (the resumed id, or a boot-minted id the first session snapshot
+  adopts, so `/relaunch` and `--resume` re-open the same store) — while the
+  runtime API server keeps the shared root. The lock itself is unchanged (the
+  store is not multi-writer safe); `CODEWHALE_RUNTIME_DIR` /
+  `DEEPSEEK_RUNTIME_DIR` keep their precedence, and the store now rides the
+  session lifecycle instead of colliding across sessions on one machine.
 
 - Fixed child tool approvals granting from an in-memory decision with no
   durable evidence (#5543, by @cyq1017): sub-agent runtimes now inherit the
@@ -236,8 +275,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (#5582), typed task error kinds enable fail-fast parallel/pipeline (R9), and
   `/workflow confirm` finds the draft despite interleaved messages.
 - Fixed the DeepSeek session that never auto-compacted at 842k/1M (#5577): the
-  exact `billed_842k_on_a_1m_window_compacts_despite_a_small_estimate`
-  regression pins the trigger.
+  footer meter now uses the same uninflated pressure signal as the trigger
+  (the 1.5× overflow estimator had painted ~561k as 842k), provider-billed
+  prompt tokens survive across turn boundaries so the next send still sees
+  them, and tests pin the DeepSeek 1M 80% threshold at 800k — 799,999 stays
+  idle, 800,000 and 842,000 compact.
 - Fixed sandbox escapes and authority gaps: workspace-write tools refuse to
   rewrite a hard-linked file instead of silently splitting the pair (S2,
   #5569; Unix only — Windows std has no link-count introspection), an opt-in
@@ -331,6 +373,13 @@ item-level change record is retained below the categorized release highlights.
   ([@aboimpinto](https://github.com/aboimpinto))** for PR #5525.
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - Sub-agent, Fleet-worker, workflow-task, and thread-runtime model turns no
   longer inherit a hidden role-based step ceiling. An omitted or zero
@@ -1579,6 +1628,13 @@ locales grow to 18 and 8.
 
 ### Changed
 
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
+
 
 - The model-facing `agent` tool advertises exactly 12 fields — `action`,
   `prompt`, `type`, `profile`, `name`, `agent_id`, `message`, `until`,
@@ -1708,6 +1764,13 @@ a published OpenAI-compatible host ship here (#5350).
   (OOM killer) remains uninterceptable by design.
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - Prompt-cache prefix is pinned for the session. The tool loop no longer
   recomposes the system prompt from disk on every model step, so an agent
@@ -2077,6 +2140,13 @@ pin that caused it rather than living around it.
 
 ### Changed
 
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
+
 - Reasoning-effort normalization and the model picker read a model's published
   `reasoning_options` list from the catalog instead of collapsing every route to
   the historic Low/Medium ladder. Any catalog row that publishes an effort list
@@ -2179,6 +2249,13 @@ runs against Pi 0.8.41 and by dogfooding repeated manual compaction.
   transcript, export, compaction, or relay text.
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - Anonymous usage counting is on by default for fresh installs and disclosed in
   a native first-run Codewhale modal with an immediate opt-out. Prior declines
@@ -2377,6 +2454,13 @@ could end productive work without a final assistant response.
   notes in their own To-do while the durable transcript retains their evidence.
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - `codewhale-cli` now contains the terminal runtime directly. Release installers
   expose byte-identical `codewhale` and `codew` commands without a separate TUI
@@ -2593,6 +2677,13 @@ File edits, terminal width, and Windows installation.
   wired into the turn pipeline and ships dormant by design.
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - `/fleet` is the familiar roster/setup face again. The operator row is the
   Fleet leader (session model); the header names the selected saved Fleet and
@@ -2952,6 +3043,13 @@ stale runtime and dependency surface.
   (#3921, #4785).
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - Model-visible built-ins now use the canonical `Bash`, `File`, and `Run`
   action schemas. `apply_patch` remains available as the one direct custom
@@ -3454,6 +3552,13 @@ says otherwise.
 
 ### Changed
 
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
+
 - Prefix-cache tool catalog entries store only the SHA-256 digest, not the
   joined catalog string. Unused plan-transition validation helpers are removed.
 
@@ -3606,6 +3711,13 @@ Thank you to the contributors whose code, reports, and reviews shaped v0.9.2:
 
 ### Changed
 
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
+
 - Rework the ambient idle ocean: the water now holds exactly one loose
   wedge school of fish, jellyfish, bubbles, and the rare whale cameo —
   seaweed and bio-dust are removed. Fish swim on a wrap-around path and
@@ -3694,6 +3806,13 @@ surface.
   missing credentials fall back to the local heuristic.
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - Keep the top activity bar literal and actionable: active To-dos appear first,
   followed by Sub-agents, while generic operations and coordination stay in
@@ -4478,6 +4597,13 @@ largest curated model-and-pricing expansion in the project so far.
 
 ### Changed
 
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
+
 - Tool-hang watchdog trimmed from 15 minutes to 10 (#1862); approval modal
   footer hints use a higher-contrast tier (#3380); status/mode copy is
   disclosed once across header, footer, cards, and sidebar instead of
@@ -4554,6 +4680,13 @@ reproductions shaped v0.9.0:
 ## [0.8.68] - 2026-07-10
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - Make the advertised Android/Termux release target buildable by generating
   QuickJS bindings against the Android NDK instead of expecting an upstream
@@ -4697,6 +4830,13 @@ reproductions shaped v0.9.0:
 
 ### Changed
 
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
+
 - Tool-hang watchdog trimmed from 15 minutes to 10 (#1862); approval modal
   footer hints use a higher-contrast tier (#3380); status/mode copy is
   disclosed once across header, footer, cards, and sidebar instead of
@@ -4801,6 +4941,13 @@ reproductions shaped v0.9.0:
   v0.8.68 (#2974, #4038).
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - Clarified the Fleet coordination hierarchy and made roles carry real
   doctrine: the **operator** (the session's `/model` selection) runs the
@@ -5068,6 +5215,13 @@ reproductions shaped v0.9.0:
   #3770, #3771, #3772).
 
 ### Changed
+
+- The marketing site hides the Sign in / Register links behind
+  `SHOW_APP_AUTH_LINKS = false` while web auth is being repaired:
+  `POST /api/auth/session-exchange` was failing 15 of 16 attempts, so
+  visitors who clicked got an error *after* an account had already been
+  created for them. app.codewhale.net stays reachable for existing users
+  and the CLI device flow; flip the flag back to restore the links.
 
 - Deferred Auto mode from the user-facing mode picker, cycle, hotbar, `/mode`
   command, and runtime-thread mode overrides until it has a distinct prompt and

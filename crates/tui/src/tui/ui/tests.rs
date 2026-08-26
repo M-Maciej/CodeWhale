@@ -13306,6 +13306,22 @@ fn issue_2739_stalled_turn_snapshot_preserves_api_messages() {
 }
 
 #[test]
+fn fresh_boot_store_session_id_is_adopted_by_the_first_snapshot() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    let boot_id = "adopted-boot-session-id".to_string();
+    app.store_session_id = Some(boot_id.clone());
+    app.api_messages.push(text_message("user", "first turn"));
+
+    // A fresh boot mints the store id before any session exists; the first
+    // snapshot must adopt it so /relaunch and --resume re-open the store.
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    assert_eq!(snapshot.metadata.id, boot_id);
+}
+
+#[test]
 fn issue_2739_esc_cancel_preserves_session_messages_before_clear() {
     let _home = SettingsHomeGuard::new();
     let tmp = tempfile::tempdir().expect("tempdir");

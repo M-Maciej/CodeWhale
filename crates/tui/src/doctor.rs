@@ -22,6 +22,7 @@ pub(crate) struct DoctorPathReport {
     pub(crate) task_manager_tasks: PathBuf,
     pub(crate) task_manager_artifacts: PathBuf,
     pub(crate) runtime_store: PathBuf,
+    pub(crate) runtime_store_session: PathBuf,
     pub(crate) runtime_events: PathBuf,
     pub(crate) personal_fleet_definitions: PathBuf,
     pub(crate) personal_fleet_agents: PathBuf,
@@ -53,6 +54,7 @@ impl DoctorPathReport {
             task_manager_root.clone(),
         );
         let runtime_store = runtime_config.data_dir;
+        let runtime_store_session = sessions.join("<session-id>").join("runtime");
         let runtime_events = runtime_store.join("events");
         let personal_fleet_definitions = crate::fleet::exact::personal_fleet_definitions_dir()
             .context("could not resolve the personal Fleet definitions directory")?;
@@ -71,6 +73,7 @@ impl DoctorPathReport {
             task_manager_tasks,
             task_manager_artifacts,
             runtime_store,
+            runtime_store_session,
             runtime_events,
             personal_fleet_definitions,
             personal_fleet_agents,
@@ -78,7 +81,7 @@ impl DoctorPathReport {
         })
     }
 
-    pub(crate) fn entries(&self) -> [(&'static str, &Path); 14] {
+    pub(crate) fn entries(&self) -> [(&'static str, &Path); 15] {
         [
             ("home", self.home.as_path()),
             ("config", self.config.as_path()),
@@ -93,6 +96,10 @@ impl DoctorPathReport {
                 self.task_manager_artifacts.as_path(),
             ),
             ("runtime_store", self.runtime_store.as_path()),
+            (
+                "runtime_store_session",
+                self.runtime_store_session.as_path(),
+            ),
             ("runtime_events", self.runtime_events.as_path()),
             (
                 "personal_fleet_definitions",

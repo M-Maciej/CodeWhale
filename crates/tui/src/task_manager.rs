@@ -1084,16 +1084,20 @@ struct QueueFile {
 }
 
 impl TaskManager {
-    /// Start the manager with the default DeepSeek executor.
+    /// Start the manager with the default DeepSeek executor and the given
+    /// (already resolved) runtime thread store config. The interactive TUI
+    /// passes a session-scoped config (#5630); the runtime API server keeps
+    /// the shared default.
     pub async fn start(
         cfg: TaskManagerConfig,
         api_config: Config,
         plugin_registry: Arc<crate::plugins::PluginRegistry>,
+        runtime_config: RuntimeThreadManagerConfig,
     ) -> Result<SharedTaskManager> {
         let runtime_threads = Arc::new(RuntimeThreadManager::open_with_plugin_registry(
             api_config.clone(),
             cfg.default_workspace.clone(),
-            RuntimeThreadManagerConfig::from_task_data_dir(cfg.data_dir.clone()),
+            runtime_config,
             plugin_registry,
         )?);
         Self::start_with_runtime_manager(cfg, api_config, runtime_threads).await

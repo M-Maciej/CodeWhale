@@ -3716,6 +3716,81 @@ fn runtime_manager_store_has_one_lifetime_process_owner() -> Result<()> {
 }
 
 #[test]
+fn runtime_store_config_from_task_data_dir_keeps_the_shared_default() {
+    let task_dir = PathBuf::from("/tmp/tasks");
+    let config = RuntimeThreadManagerConfig::from_task_data_dir(task_dir.clone());
+    assert_eq!(config.data_dir, task_dir.join("runtime"));
+    assert_eq!(config.task_data_dir, task_dir);
+}
+
+#[test]
+fn runtime_store_config_for_session_scopes_the_root_per_session() {
+    let sessions = PathBuf::from("/tmp/sessions");
+    let task_dir = PathBuf::from("/tmp/tasks");
+    let config = RuntimeThreadManagerConfig::for_session(&sessions, "sess-1", task_dir.clone());
+    assert_eq!(config.data_dir, sessions.join("sess-1").join("runtime"));
+    assert_eq!(config.task_data_dir, task_dir);
+}
+
+#[test]
+fn runtime_store_config_for_session_keeps_env_override_precedence() {
+    let _lock = crate::test_support::lock_test_env();
+    let _override =
+        crate::test_support::EnvVarGuard::set("CODEWHALE_RUNTIME_DIR", "/tmp/override-store");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+    let config = RuntimeThreadManagerConfig::for_session(
+        Path::new("/tmp/sessions"),
+        "sess-1",
+        PathBuf::from("/tmp/tasks"),
+    );
+    assert_eq!(config.data_dir, PathBuf::from("/tmp/override-store"));
+}
+
+fn session_scoped_manager(sessions_dir: &Path, session_id: &str) -> Result<RuntimeThreadManager> {
+    RuntimeThreadManager::open(
+        Config::default(),
+        PathBuf::from("."),
+        RuntimeThreadManagerConfig::for_session(sessions_dir, session_id, test_runtime_dir()),
+    )
+}
+
+#[test]
+fn runtime_store_for_session_has_one_owner_per_session() -> Result<()> {
+    let dir = test_runtime_dir();
+    std::fs::create_dir_all(&dir)?;
+    let sessions = dir.join("sessions");
+    let signal = dir.join("session-owner.ready");
+    let held_root = sessions.join("session-a").join("runtime");
+    // The holder child opens the store at `<sessions>/session-a/runtime` and
+    // keeps the process owner lock; its release barrier is `<root>/process-
+    // writers.start` (set by the spawn helper).
+    let child = spawn_runtime_event_child("manager-holder", &held_root, "thr_unused", &signal);
+    wait_for_runtime_event_test_file(&signal, "session manager owner readiness");
+
+    // The same session id must still collide: the owner lock is alive.
+    let error = match session_scoped_manager(&sessions, "session-a") {
+        Ok(_) => panic!("a second process must not open the same session's Runtime store"),
+        Err(error) => error,
+    };
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("already active in another process"),
+        "unexpected owner-lock error: {error:#}"
+    );
+
+    // A different session id gets its own store: no machine-wide collision.
+    let other = session_scoped_manager(&sessions, "session-b")?;
+    drop(other);
+
+    std::fs::write(held_root.join("process-writers.start"), b"release")?;
+    child.wait_success("session Runtime manager owner holder");
+    let reopened = session_scoped_manager(&sessions, "session-a")?;
+    drop(reopened);
+    std::fs::remove_dir_all(dir)?;
+    Ok(())
+}
+
+#[test]
 fn fresh_runtime_manager_store_race_has_exactly_one_process_owner() -> Result<()> {
     let control = test_runtime_dir();
     std::fs::create_dir_all(&control)?;

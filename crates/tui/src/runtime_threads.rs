@@ -307,17 +307,51 @@ pub struct RuntimeThreadManagerConfig {
 impl RuntimeThreadManagerConfig {
     #[must_use]
     pub fn from_task_data_dir(task_data_dir: PathBuf) -> Self {
-        let data_dir = std::env::var("CODEWHALE_RUNTIME_DIR")
-            .or_else(|_| std::env::var("DEEPSEEK_RUNTIME_DIR"))
-            .ok()
-            .filter(|override_dir| !override_dir.trim().is_empty())
-            .map_or_else(|| task_data_dir.join("runtime"), PathBuf::from);
+        Self::resolved(task_data_dir, None)
+    }
+
+    /// Session-scoped default for interactive sessions (#5630): the store
+    /// root is `<sessions-dir>/<session-id>/runtime` — inside the same
+    /// per-session artifact directory the control socket uses, so session
+    /// deletion and the orphan-reclaim sweep cover the store too. Env
+    /// overrides (`CODEWHALE_RUNTIME_DIR` / legacy `DEEPSEEK_RUNTIME_DIR`)
+    /// keep their precedence over the session default.
+    #[must_use]
+    pub fn for_session(sessions_dir: &Path, session_id: &str, task_data_dir: PathBuf) -> Self {
+        Self::resolved(
+            task_data_dir,
+            Some((sessions_dir.to_path_buf(), session_id.to_string())),
+        )
+    }
+
+    fn resolved(task_data_dir: PathBuf, session: Option<(PathBuf, String)>) -> Self {
+        let data_dir = match runtime_store_dir_override() {
+            Some(override_dir) => override_dir,
+            None => match session {
+                Some((sessions_dir, session_id)) => sessions_dir.join(session_id).join("runtime"),
+                None => task_data_dir.join("runtime"),
+            },
+        };
         Self {
             data_dir,
             task_data_dir,
             max_active_threads: MAX_ACTIVE_THREADS_DEFAULT,
         }
     }
+}
+
+/// The env overrides that relocate the runtime store wholesale
+/// (`CODEWHALE_RUNTIME_DIR`, legacy `DEEPSEEK_RUNTIME_DIR`). A non-empty
+/// value always wins over any default, session-scoped or not.
+fn runtime_store_dir_override() -> Option<PathBuf> {
+    for var in ["CODEWHALE_RUNTIME_DIR", "DEEPSEEK_RUNTIME_DIR"] {
+        if let Ok(value) = std::env::var(var)
+            && !value.trim().is_empty()
+        {
+            return Some(PathBuf::from(value));
+        }
+    }
+    None
 }
 
 /// Visibility filter for `list_threads`. Default is `ActiveOnly`. The runtime

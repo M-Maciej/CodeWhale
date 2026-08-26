@@ -358,6 +358,10 @@ fn explicit_codewhale_home_owns_every_default_user_path() {
     );
     assert_eq!(report.runtime_store, runtime_config.data_dir);
     assert_eq!(
+        report.runtime_store_session,
+        report.sessions.join("<session-id>").join("runtime")
+    );
+    assert_eq!(
         report.runtime_events,
         runtime_config.data_dir.join("events")
     );
@@ -371,7 +375,7 @@ fn explicit_codewhale_home_owns_every_default_user_path() {
     );
     assert_eq!(report.secrets, secrets);
     assert_eq!(legacy_secrets, None);
-    assert_eq!(report.entries().len(), 14);
+    assert_eq!(report.entries().len(), 15);
     let json = serde_json::to_value(&report).expect("serialize path snapshot");
     for (label, path) in report.entries() {
         assert_eq!(

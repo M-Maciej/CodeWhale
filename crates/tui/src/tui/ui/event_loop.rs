@@ -329,7 +329,9 @@ pub async fn run_tui(
         }
     }
 
-    // Load existing session if resuming.
+    // Load existing session if resuming. The resolved id also keys this
+    // process's per-session runtime store (#5630).
+    let mut resolved_resume_session_id: Option<String> = None;
     if let Some(ref session_id) = options.resume_session_id
         && let Ok(manager) = SessionManager::default_location()
     {
@@ -347,24 +349,33 @@ pub async fn run_tui(
             };
 
         match load_result {
-            Ok(Some(saved)) => match manager.load_session_goal(&saved.metadata.id) {
-                Ok(goal) => {
-                    match apply_loaded_session_with_goal(&mut app, config, &saved, goal.as_ref()) {
-                        Ok(()) => {
-                            app.status_message = Some(format!(
-                                "Resumed session: {}",
-                                crate::session_manager::truncate_id(&saved.metadata.id)
-                            ));
-                        }
-                        Err(err) => {
-                            app.status_message = Some(format!("Failed to restore session: {err}"));
+            Ok(Some(saved)) => {
+                resolved_resume_session_id = Some(saved.metadata.id.clone());
+                match manager.load_session_goal(&saved.metadata.id) {
+                    Ok(goal) => {
+                        match apply_loaded_session_with_goal(
+                            &mut app,
+                            config,
+                            &saved,
+                            goal.as_ref(),
+                        ) {
+                            Ok(()) => {
+                                app.status_message = Some(format!(
+                                    "Resumed session: {}",
+                                    crate::session_manager::truncate_id(&saved.metadata.id)
+                                ));
+                            }
+                            Err(err) => {
+                                app.status_message =
+                                    Some(format!("Failed to restore session: {err}"));
+                            }
                         }
                     }
+                    Err(err) => {
+                        app.status_message = Some(format!("Failed to restore session goal: {err}"));
+                    }
                 }
-                Err(err) => {
-                    app.status_message = Some(format!("Failed to restore session goal: {err}"));
-                }
-            },
+            }
             Ok(None) => {
                 app.status_message = Some("No sessions found to resume".to_string());
             }
@@ -411,15 +422,32 @@ pub async fn run_tui(
         }
     }
 
+    // Per-session runtime store root (#5630): the store follows the session
+    // this process owns. Resume adopts the resolved session id; a fresh boot
+    // mints one and the first session snapshot reuses it, so /relaunch and
+    // --resume re-open the same store. Env overrides keep their precedence.
+    let store_session_id =
+        resolved_resume_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    app.store_session_id = Some(store_session_id.clone());
+    let sessions_dir = SessionManager::default_location()?
+        .sessions_dir()
+        .to_path_buf();
+    let task_config = TaskManagerConfig::from_runtime(
+        config,
+        app.workspace.clone(),
+        Some(app.model.clone()),
+        Some(app.max_subagents.clamp(1, 4)),
+    );
+    let runtime_config = crate::runtime_threads::RuntimeThreadManagerConfig::for_session(
+        &sessions_dir,
+        &store_session_id,
+        task_config.data_dir.clone(),
+    );
     let task_manager = TaskManager::start(
-        TaskManagerConfig::from_runtime(
-            config,
-            app.workspace.clone(),
-            Some(app.model.clone()),
-            Some(app.max_subagents.clamp(1, 4)),
-        ),
+        task_config,
         config.clone(),
         std::sync::Arc::clone(&app.plugin_registry),
+        runtime_config,
     )
     .await?;
     let automations = std::sync::Arc::new(tokio::sync::Mutex::new(

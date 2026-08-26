@@ -3717,6 +3717,9 @@ fn runtime_manager_store_has_one_lifetime_process_owner() -> Result<()> {
 
 #[test]
 fn runtime_store_config_from_task_data_dir_keeps_the_shared_default() {
+    let _lock = crate::test_support::lock_test_env();
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
     let task_dir = PathBuf::from("/tmp/tasks");
     let config = RuntimeThreadManagerConfig::from_task_data_dir(task_dir.clone());
     assert_eq!(config.data_dir, task_dir.join("runtime"));
@@ -3725,6 +3728,9 @@ fn runtime_store_config_from_task_data_dir_keeps_the_shared_default() {
 
 #[test]
 fn runtime_store_config_for_session_scopes_the_root_per_session() {
+    let _lock = crate::test_support::lock_test_env();
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
     let sessions = PathBuf::from("/tmp/sessions");
     let task_dir = PathBuf::from("/tmp/tasks");
     let config = RuntimeThreadManagerConfig::for_session(&sessions, "sess-1", task_dir.clone());
@@ -3746,6 +3752,35 @@ fn runtime_store_config_for_session_keeps_env_override_precedence() {
     assert_eq!(config.data_dir, PathBuf::from("/tmp/override-store"));
 }
 
+#[test]
+fn runtime_store_config_for_session_refuses_ids_that_could_escape_the_scope() {
+    let _lock = crate::test_support::lock_test_env();
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
+    let task_dir = PathBuf::from("/tmp/tasks");
+    for id in ["", "/tmp/evil", "a/b", "..", "../x", "a\\b"] {
+        let config = RuntimeThreadManagerConfig::for_session(
+            Path::new("/tmp/sessions"),
+            id,
+            task_dir.clone(),
+        );
+        assert_eq!(
+            config.data_dir,
+            task_dir.join("runtime"),
+            "id {id:?} must fall back to the shared default instead of relocating the store"
+        );
+    }
+    let scoped = RuntimeThreadManagerConfig::for_session(
+        Path::new("/tmp/sessions"),
+        "adopted-boot-session-id",
+        task_dir.clone(),
+    );
+    assert_eq!(
+        scoped.data_dir,
+        PathBuf::from("/tmp/sessions/adopted-boot-session-id/runtime")
+    );
+}
+
 fn session_scoped_manager(sessions_dir: &Path, session_id: &str) -> Result<RuntimeThreadManager> {
     RuntimeThreadManager::open(
         Config::default(),
@@ -3756,6 +3791,9 @@ fn session_scoped_manager(sessions_dir: &Path, session_id: &str) -> Result<Runti
 
 #[test]
 fn runtime_store_for_session_has_one_owner_per_session() -> Result<()> {
+    let _lock = crate::test_support::lock_test_env();
+    let _runtime = crate::test_support::EnvVarGuard::remove("CODEWHALE_RUNTIME_DIR");
+    let _legacy = crate::test_support::EnvVarGuard::remove("DEEPSEEK_RUNTIME_DIR");
     let dir = test_runtime_dir();
     std::fs::create_dir_all(&dir)?;
     let sessions = dir.join("sessions");

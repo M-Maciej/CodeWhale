@@ -996,7 +996,7 @@ fn web_launcher_warning(result: Result<()>) -> Option<String> {
     })
 }
 
-fn fallback_sessions_dir() -> PathBuf {
+pub(crate) fn fallback_sessions_dir() -> PathBuf {
     if let Some(home) = codewhale_paths::codewhale_home_override().ok().flatten() {
         return home.join("sessions");
     }

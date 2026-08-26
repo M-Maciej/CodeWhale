@@ -195,10 +195,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their store root to `<sessions-dir>/<session-id>/runtime` — the session the
   process owns (the resumed id, or a boot-minted id the first session snapshot
   adopts, so `/relaunch` and `--resume` re-open the same store) — while the
-  runtime API server keeps the shared root. The lock itself is unchanged (the
-  store is not multi-writer safe); `CODEWHALE_RUNTIME_DIR` /
-  `DEEPSEEK_RUNTIME_DIR` keep their precedence, and the store now rides the
-  session lifecycle instead of colliding across sessions on one machine.
+  runtime API server keeps the shared root. Session records carry the owning
+  store id, so a mid-process switch (`/new`, picker) still re-opens the right
+  store; the orphan-reclaim sweep probes the store's owner lock before
+  deleting a directory; a failed resume never adopts an existing record's id;
+  and session ids are validated before joining the store path. The lock
+  itself is unchanged (the store is not multi-writer safe);
+  `CODEWHALE_RUNTIME_DIR` / `DEEPSEEK_RUNTIME_DIR` keep their precedence.
 
 - Fixed child tool approvals granting from an in-memory decision with no
   durable evidence (#5543, by @cyq1017): sub-agent runtimes now inherit the

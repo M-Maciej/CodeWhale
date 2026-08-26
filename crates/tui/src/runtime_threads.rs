@@ -86,7 +86,7 @@ const STREAM_DELTA_BATCH_MAX_BYTES: usize = 16 * 1024;
 const EVENT_TRANSACTION_LOCK_TIMEOUT: Duration = Duration::from_secs(5);
 const EVENT_TRANSACTION_LOCK_POLL: Duration = Duration::from_millis(5);
 const EVENT_TRANSACTION_LOCK_FILE: &str = "events.lock";
-const RUNTIME_PROCESS_OWNER_LOCK_FILE: &str = "runtime-process.owner.lock";
+pub(crate) const RUNTIME_PROCESS_OWNER_LOCK_FILE: &str = "runtime-process.owner.lock";
 const AGENT_MAIL_OWNER_FILE: &str = "owner.json";
 const TURN_OPERATION_BINDING_SCHEMA_VERSION: u32 = 1;
 const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
@@ -316,8 +316,15 @@ impl RuntimeThreadManagerConfig {
     /// deletion and the orphan-reclaim sweep cover the store too. Env
     /// overrides (`CODEWHALE_RUNTIME_DIR` / legacy `DEEPSEEK_RUNTIME_DIR`)
     /// keep their precedence over the session default.
+    ///
+    /// A `session_id` that could escape the scope (absolute path, path
+    /// separators, `..`) is refused: the config falls back to the shared
+    /// default instead of letting a crafted record relocate the store.
     #[must_use]
     pub fn for_session(sessions_dir: &Path, session_id: &str, task_data_dir: PathBuf) -> Self {
+        if !valid_store_session_scope(session_id) {
+            return Self::from_task_data_dir(task_data_dir);
+        }
         Self::resolved(
             task_data_dir,
             Some((sessions_dir.to_path_buf(), session_id.to_string())),
@@ -352,6 +359,20 @@ fn runtime_store_dir_override() -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// A store-scope session id must stay inside the sessions dir: non-empty,
+/// relative, a single normal component. Session ids are minted UUIDs, but
+/// `for_session` also receives ids read back from saved session records, so
+/// the scope is validated before it is joined into the filesystem.
+fn valid_store_session_scope(session_id: &str) -> bool {
+    let path = Path::new(session_id);
+    !session_id.is_empty()
+        && !path.is_absolute()
+        && !session_id.contains(['/', '\\'])
+        && path
+            .components()
+            .all(|component| matches!(component, Component::Normal(_)))
 }
 
 /// Visibility filter for `list_threads`. Default is `ActiveOnly`. The runtime

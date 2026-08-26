@@ -350,7 +350,11 @@ pub async fn run_tui(
 
         match load_result {
             Ok(Some(saved)) => {
-                resolved_resume_session_id = Some(saved.metadata.id.clone());
+                let store_owner_id = saved
+                    .metadata
+                    .runtime_store_session_id
+                    .clone()
+                    .unwrap_or_else(|| saved.metadata.id.clone());
                 match manager.load_session_goal(&saved.metadata.id) {
                     Ok(goal) => {
                         match apply_loaded_session_with_goal(
@@ -360,6 +364,11 @@ pub async fn run_tui(
                             goal.as_ref(),
                         ) {
                             Ok(()) => {
+                                // The resume only counts once the session is
+                                // fully applied; a failed resume must mint a
+                                // fresh id rather than adopt one that already
+                                // belongs to an existing transcript (#5630).
+                                resolved_resume_session_id = Some(store_owner_id);
                                 app.status_message = Some(format!(
                                     "Resumed session: {}",
                                     crate::session_manager::truncate_id(&saved.metadata.id)
@@ -429,9 +438,11 @@ pub async fn run_tui(
     let store_session_id =
         resolved_resume_session_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     app.store_session_id = Some(store_session_id.clone());
-    let sessions_dir = SessionManager::default_location()?
-        .sessions_dir()
-        .to_path_buf();
+    // A session-dir failure must not hard-fail startup (it could not before
+    // #5630); fall back to the same path the runtime API uses.
+    let sessions_dir = SessionManager::default_location()
+        .map(|manager| manager.sessions_dir().to_path_buf())
+        .unwrap_or_else(|_| crate::runtime_api::fallback_sessions_dir());
     let task_config = TaskManagerConfig::from_runtime(
         config,
         app.workspace.clone(),

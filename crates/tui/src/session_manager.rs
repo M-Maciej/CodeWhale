@@ -137,6 +137,14 @@ pub struct SessionContextReference {
 pub struct SessionMetadata {
     /// Unique session identifier
     pub id: String,
+    /// Session id that owns this session's per-session runtime store
+    /// (`<sessions-dir>/<id>/runtime`, #5630). When the transcript session
+    /// was switched mid-process (`/new`, picker), this names the boot
+    /// session whose store the process kept using; `/relaunch` and
+    /// `--resume` re-open that store instead of an empty one. Absent on
+    /// records saved before #5630 — those resolve to their own id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_store_session_id: Option<String>,
     /// Human-readable title (derived from first message)
     pub title: String,
     /// When the session was created
@@ -818,6 +826,7 @@ impl SavedSession {
             .unwrap_or_else(|| crate::session_manager::DEFAULT_SESSION_TITLE.to_string());
         let metadata = SessionMetadata {
             id: Uuid::new_v4().to_string(),
+            runtime_store_session_id: None,
             title,
             created_at: now,
             updated_at: now,
@@ -1682,6 +1691,70 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Probe `<dir>/runtime/runtime-process.owner.lock` — the per-session
+    /// runtime store's process-owner lock (#5630).
+    ///
+    /// - `None`: a live process holds the lock; the directory must be left alone.
+    /// - `Some(None)`: the directory has no runtime store lock file; nothing to
+    ///   protect, proceed with removal.
+    /// - `Some(Some(file))`: this process acquired the lock; keep the file handle
+    ///   alive through the removal so no process can open the store in between.
+    #[cfg(unix)]
+    fn probe_live_runtime_store_owner(dir: &Path) -> Option<Option<fs::File>> {
+        use std::os::fd::AsRawFd as _;
+        let lock_path = dir
+            .join("runtime")
+            .join(crate::runtime_threads::RUNTIME_PROCESS_OWNER_LOCK_FILE);
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(None),
+            Err(_) => return None,
+        };
+        let acquired = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        if acquired { Some(Some(file)) } else { None }
+    }
+
+    /// Windows: `LockFile` probe, then release. Windows cannot remove a directory
+    /// that contains an open file, so the probe cannot hold the lock through the
+    /// removal; the probe-then-remove window is the same tiny race the sweep
+    /// already accepts on Windows.
+    #[cfg(windows)]
+    fn probe_live_runtime_store_owner(dir: &Path) -> Option<Option<fs::File>> {
+        use std::os::windows::io::AsRawHandle as _;
+        let lock_path = dir
+            .join("runtime")
+            .join(crate::runtime_threads::RUNTIME_PROCESS_OWNER_LOCK_FILE);
+        let file = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+        {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Some(None),
+            Err(_) => return None,
+        };
+        let acquired = unsafe {
+            windows_sys::Win32::Storage::FileSystem::LockFile(
+                file.as_raw_handle() as _,
+                0,
+                0,
+                u32::MAX,
+                u32::MAX,
+            )
+        } != 0;
+        drop(file);
+        if acquired { Some(None) } else { None }
+    }
+
+    #[cfg(not(any(unix, windows)))]
+    fn probe_live_runtime_store_owner(_dir: &Path) -> Option<Option<fs::File>> {
+        Some(None)
+    }
+
     /// Ceiling on orphan directories reclaimed per `cleanup` call.
     ///
     /// Reconciliation runs on the save path, so it must never turn one save
@@ -1755,6 +1828,17 @@ impl SessionManager {
             {
                 continue;
             }
+            // #5630: a boot-minted store dir has no session document until the
+            // first snapshot, and liveness is process-local, so another
+            // process's sweep must not delete a live session's runtime store.
+            // Probe the store's owner lock: if a live process holds it, leave
+            // the directory alone; otherwise hold the lock through the
+            // removal so nothing can race in behind the probe.
+            let store_owner_guard = match Self::probe_live_runtime_store_owner(&entry.path()) {
+                Some(guard) => guard,
+                None => continue,
+            };
+            let _held = store_owner_guard;
             if fs::remove_dir_all(entry.path()).is_ok() {
                 reclaimed += 1;
             }
@@ -2143,6 +2227,7 @@ pub fn create_saved_session_with_id_and_mode(
         schema_version: CURRENT_SESSION_SCHEMA_VERSION,
         metadata: SessionMetadata {
             id,
+            runtime_store_session_id: None,
             title,
             created_at: now,
             updated_at: now,
@@ -2775,6 +2860,7 @@ mod tests {
             messages: vec![make_test_message("user", "hi")],
             metadata: SessionMetadata {
                 id: id.to_string(),
+                runtime_store_session_id: None,
                 title: format!("session-{id}"),
                 created_at: updated_at,
                 updated_at,
@@ -2816,6 +2902,7 @@ mod tests {
             messages: Vec::new(),
             metadata: SessionMetadata {
                 id: id.to_string(),
+                runtime_store_session_id: None,
                 title: DEFAULT_SESSION_TITLE.to_string(),
                 created_at: updated_at,
                 updated_at,
@@ -4735,5 +4822,35 @@ mod tests {
             err.to_string().contains("newer than supported"),
             "unexpected error: {err}"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn orphan_sweep_skips_a_live_runtime_store() -> std::io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        let tmp = tempdir()?;
+        let manager = SessionManager::new(tmp.path().join("sessions"))?;
+        let id = Uuid::new_v4().to_string();
+        let dir = manager.sessions_dir().join(&id);
+        let store = dir.join("runtime");
+        std::fs::create_dir_all(&store)?;
+        let lock = store.join(crate::runtime_threads::RUNTIME_PROCESS_OWNER_LOCK_FILE);
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock)?;
+        let held = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0;
+        assert!(held, "test setup must hold the store owner flock");
+
+        // A second open file description conflicts even in the same process,
+        // so the probe sees a live owner and the dir must survive.
+        manager.reclaim_orphaned_session_dirs();
+        assert!(dir.exists(), "a live store dir must survive the sweep");
+
+        drop(file); // release the flock — the store is now dead
+        manager.reclaim_orphaned_session_dirs();
+        assert!(!dir.exists(), "a dead store dir should be swept");
+        Ok(())
     }
 }

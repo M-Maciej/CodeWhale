@@ -6161,6 +6161,7 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
         schema_version: 1,
         metadata: crate::session_manager::SessionMetadata {
             id: "resume-recovery-session".to_string(),
+            runtime_store_session_id: None,
             title: "resume recovery".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -13319,6 +13320,65 @@ fn fresh_boot_store_session_id_is_adopted_by_the_first_snapshot() {
     // snapshot must adopt it so /relaunch and --resume re-open the store.
     let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
     assert_eq!(snapshot.metadata.id, boot_id);
+    assert_eq!(
+        snapshot.metadata.runtime_store_session_id.as_deref(),
+        Some(boot_id.as_str())
+    );
+}
+
+#[test]
+fn fresh_boot_adoption_never_overwrites_an_existing_record() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    // A partially failed --resume leaves the store id pointing at an existing
+    // record; the first snapshot must mint a fresh id, not clobber it.
+    let existing_id = "existing-record-id".to_string();
+    let existing = crate::session_manager::create_saved_session_with_id_and_mode(
+        existing_id.clone(),
+        &[],
+        "model",
+        std::path::Path::new("."),
+        0,
+        None,
+        None,
+    );
+    manager
+        .save_session(&existing)
+        .expect("save existing session");
+
+    let mut app = create_test_app();
+    app.store_session_id = Some(existing_id.clone());
+    app.api_messages.push(text_message("user", "first turn"));
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    assert_ne!(
+        snapshot.metadata.id, existing_id,
+        "adoption must never reuse an id that already has a record"
+    );
+    // The record still names the store its process used.
+    assert_eq!(
+        snapshot.metadata.runtime_store_session_id.as_deref(),
+        Some(existing_id.as_str())
+    );
+}
+
+#[test]
+fn snapshot_stamps_the_store_id_after_a_mid_process_session_switch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    // /new mints a fresh transcript id while the store stays with the boot id.
+    app.current_session_id = Some("switched-transcript-id".to_string());
+    app.store_session_id = Some("boot-store-id".to_string());
+    app.api_messages.push(text_message("user", "first turn"));
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    assert_eq!(snapshot.metadata.id, "switched-transcript-id");
+    assert_eq!(
+        snapshot.metadata.runtime_store_session_id.as_deref(),
+        Some("boot-store-id")
+    );
 }
 
 #[test]

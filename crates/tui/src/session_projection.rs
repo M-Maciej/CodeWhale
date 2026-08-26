@@ -330,6 +330,7 @@ mod tests {
         let ts = Utc::now() - Duration::minutes(minutes_ago);
         SessionMetadata {
             id: id.to_string(),
+            runtime_store_session_id: None,
             title: title.to_string(),
             created_at: ts,
             updated_at: ts,

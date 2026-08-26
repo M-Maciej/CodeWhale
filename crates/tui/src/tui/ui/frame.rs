@@ -372,16 +372,30 @@ pub(crate) fn build_session_snapshot(
     } else if let Some(store_id) = app.store_session_id.clone() {
         // Fresh boot with a per-session runtime store (#5630): adopt the boot
         // id as the transcript id so `/relaunch` and `--resume` re-open the
-        // same store this process's managed threads live in.
-        create_saved_session_with_id_and_mode(
-            store_id,
-            &app.api_messages,
-            &model,
-            &app.workspace,
-            u64::from(app.session.total_tokens),
-            app.system_prompt.as_ref(),
-            Some(app.mode.as_setting()),
-        )
+        // same store this process's managed threads live in. A partially
+        // failed `--resume` can leave the store id pointing at an existing
+        // record; never let that overwrite a real transcript.
+        let claimed_on_disk = manager.load_session(&store_id).is_ok();
+        if claimed_on_disk {
+            create_saved_session_with_mode(
+                &app.api_messages,
+                &model,
+                &app.workspace,
+                u64::from(app.session.total_tokens),
+                app.system_prompt.as_ref(),
+                Some(app.mode.as_setting()),
+            )
+        } else {
+            create_saved_session_with_id_and_mode(
+                store_id,
+                &app.api_messages,
+                &model,
+                &app.workspace,
+                u64::from(app.session.total_tokens),
+                app.system_prompt.as_ref(),
+                Some(app.mode.as_setting()),
+            )
+        }
     } else {
         create_saved_session_with_mode(
             &app.api_messages,
@@ -392,6 +406,11 @@ pub(crate) fn build_session_snapshot(
             Some(app.mode.as_setting()),
         )
     };
+    // Every record names the runtime store its process used (#5630): after a
+    // mid-process session switch (`/new`, picker) the transcript id and the
+    // store id differ, and `/relaunch`/`--resume` must re-open the store the
+    // threads actually live in.
+    session.metadata.runtime_store_session_id = app.store_session_id.clone();
     let computed_title = session.metadata.title.clone();
     if let Some(cached) = app
         .current_session_metadata

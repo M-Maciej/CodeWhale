@@ -1254,6 +1254,7 @@ mod tests {
     fn test_session(idx: usize, title: &str) -> SessionMetadata {
         SessionMetadata {
             id: format!("session-{idx:02}"),
+            runtime_store_session_id: None,
             title: title.to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

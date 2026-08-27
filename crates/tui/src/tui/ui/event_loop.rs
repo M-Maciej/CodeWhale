@@ -367,6 +367,16 @@ pub async fn run_tui(
                 Ok(goal) => {
                     match apply_loaded_session_with_goal(&mut app, config, &saved, goal.as_ref()) {
                         Ok(()) => {
+                            // The record names the store its process used
+                            // (#5630): after a mid-process switch, /relaunch
+                            // and --resume must re-open that store.
+                            app.store_session_id = Some(
+                                saved
+                                    .metadata
+                                    .runtime_store_session_id
+                                    .clone()
+                                    .unwrap_or_else(|| saved.metadata.id.clone()),
+                            );
                             app.status_message = Some(format!(
                                 "Resumed session: {}",
                                 crate::session_manager::truncate_id(&saved.metadata.id)
@@ -428,6 +438,16 @@ pub async fn run_tui(
     }
 
     let session_id = ensure_runtime_session_id(&mut app);
+    // After a mid-process switch (/new, picker) the transcript id changed
+    // while the store must stay with the session the process booted as;
+    // remember the owning id separately (#5630).
+    if app.store_session_id.is_none() {
+        app.store_session_id = Some(session_id.clone());
+    }
+    let store_session_id = app
+        .store_session_id
+        .clone()
+        .expect("store session id set above");
     let task_manager = TaskManager::start(
         TaskManagerConfig::from_runtime(
             config,
@@ -437,7 +457,7 @@ pub async fn run_tui(
         ),
         config.clone(),
         std::sync::Arc::clone(&app.plugin_registry),
-        &session_id,
+        &store_session_id,
     )
     .await?;
     let automations = std::sync::Arc::new(tokio::sync::Mutex::new(

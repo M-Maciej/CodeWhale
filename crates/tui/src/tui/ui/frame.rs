@@ -381,6 +381,11 @@ pub(crate) fn build_session_snapshot(
             Some(app.mode.as_setting()),
         )
     };
+    // Every record names the runtime store its process used (#5630): after a
+    // mid-process session switch (`/new`, picker) the transcript id and the
+    // store id differ, and `/relaunch`/`--resume` must re-open the store the
+    // threads actually live in.
+    session.metadata.runtime_store_session_id = app.store_session_id.clone();
     let computed_title = session.metadata.title.clone();
     if let Some(cached) = app
         .current_session_metadata

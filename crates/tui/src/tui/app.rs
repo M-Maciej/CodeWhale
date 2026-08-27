@@ -1743,6 +1743,12 @@ pub struct App {
     pub backtrack: crate::tui::backtrack::BacktrackState,
     /// Current session ID for auto-save updates
     pub current_session_id: Option<String>,
+    /// Session id that owns this process's per-session runtime store
+    /// (`<sessions-dir>/<id>/runtime`, #5630). Resolved from the resumed
+    /// record at startup, otherwise the boot-minted id; `/relaunch` and
+    /// `--resume` re-open this store after a mid-process `/new` or picker
+    /// switch changed the transcript id.
+    pub store_session_id: Option<String>,
     /// Last non-contended Work snapshot captured in this App. The outer
     /// option distinguishes "never captured" from a captured empty state.
     pub(crate) last_known_work_state: Option<Option<SessionWorkState>>,

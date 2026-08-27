@@ -6109,6 +6109,7 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
         schema_version: 1,
         metadata: crate::session_manager::SessionMetadata {
             id: "resume-recovery-session".to_string(),
+            runtime_store_session_id: None,
             title: "resume recovery".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -23793,5 +23794,24 @@ fn focused_agent_transcript_receives_wheel_scroll_through_the_frame() {
     assert!(
         app.viewport.transcript_scroll.is_at_tail(),
         "the invisible main transcript must not consume the focused pane's scroll"
+    );
+}
+
+#[test]
+fn snapshot_stamps_the_store_id_after_a_mid_process_session_switch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    // /new mints a fresh transcript id while the store stays with the boot id.
+    app.current_session_id = Some("switched-transcript-id".to_string());
+    app.store_session_id = Some("boot-store-id".to_string());
+    app.api_messages.push(text_message("user", "first turn"));
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    assert_eq!(snapshot.metadata.id, "switched-transcript-id");
+    assert_eq!(
+        snapshot.metadata.runtime_store_session_id.as_deref(),
+        Some("boot-store-id")
     );
 }

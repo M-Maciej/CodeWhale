@@ -13347,3 +13347,52 @@ fn picker_and_request_path_disagree_when_the_secret_slot_marker_is_missing() -> 
     println!("CAPTURED first-fix: {:?}", resolution.first_fix());
     Ok(())
 }
+
+#[test]
+fn engine_max_turn_wall_time_resolves_default_unbounded_and_clamp() {
+    let default_config = Config::default();
+    assert_eq!(
+        default_config.max_turn_wall_time(),
+        Duration::from_secs(30 * 60),
+        "unset [engine] must keep the built-in 1800s default"
+    );
+
+    let unbounded = Config {
+        engine: Some(EngineControls {
+            max_turn_wall_time_secs: Some(0),
+        }),
+        ..Config::default()
+    };
+    assert_eq!(
+        unbounded.max_turn_wall_time(),
+        Duration::ZERO,
+        "0 must remove the budget entirely"
+    );
+
+    let raised = Config {
+        engine: Some(EngineControls {
+            max_turn_wall_time_secs: Some(50_000),
+        }),
+        ..Config::default()
+    };
+    assert_eq!(raised.max_turn_wall_time(), Duration::from_secs(50_000));
+
+    let clamped = Config {
+        engine: Some(EngineControls {
+            max_turn_wall_time_secs: Some(2_000_000),
+        }),
+        ..Config::default()
+    };
+    assert_eq!(
+        clamped.max_turn_wall_time(),
+        Duration::from_secs(86_400),
+        "positive values clamp to the 24h ceiling"
+    );
+}
+
+#[test]
+fn engine_max_turn_wall_time_parses_from_toml() {
+    let config: Config = toml::from_str("[engine]\nmax_turn_wall_time_secs = 50000\n")
+        .expect("parse [engine] table");
+    assert_eq!(config.max_turn_wall_time(), Duration::from_secs(50_000));
+}

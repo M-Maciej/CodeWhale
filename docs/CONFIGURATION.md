@@ -2269,6 +2269,24 @@ continuation_delay_seconds = 300
 The effective delay is capped at 86,400 seconds (24 hours); use an automation
 for schedules that are less frequent than once per day.
 
+### Engine controls (`[engine]`)
+
+Every engine turn (goal continuations, background tasks) carries a wall-clock
+budget that stops a wedged turn. The built-in default is 1,800 seconds (30
+minutes); it can be raised, removed, or lowered:
+
+```toml
+[engine]
+# Per-turn wall-clock budget in seconds.
+# Unset keeps the built-in 1800s (30 minutes).
+# 0 = unbounded (no time-based stop; not recommended for unattended runs).
+# Positive values clamp to 1..=86400 at resolution.
+max_turn_wall_time_secs = 50000
+```
+
+When the budget fires, the turn fails with "Turn exceeded its wall-clock
+budget"; the goal pauses and can be resumed.
+
 When an explicit backstop fires, the goal pauses with a status message naming
 `[goal] max_continuations` and a warning is logged; resume the goal after
 inspecting progress, or raise/disable the backstop.

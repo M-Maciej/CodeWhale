@@ -8,6 +8,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Optional `[engine] max_turn_wall_time_secs` config table: per-turn
+  wall-clock budget for engine turns. Unset keeps the built-in 1800s
+  (30 minutes); `0` removes the budget entirely; positive values clamp to
+  1..=86400. Exposed in the `/config` editor.
 
 - Compaction now keeps a bounded verbatim last round (the latest user
   message plus its assistant/tool results) instead of discarding every

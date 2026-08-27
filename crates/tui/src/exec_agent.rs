@@ -213,7 +213,7 @@ pub(crate) async fn run_exec_agent(
         project_context_pack_enabled: execution_config.project_context_pack_enabled(),
         translation_enabled: false,
         max_steps: max_turns,
-        max_wall_time: crate::core::engine::DEFAULT_MAX_WALL_TIME,
+        max_wall_time: execution_config.max_turn_wall_time(),
         max_subagents,
         max_admitted_subagents: execution_config
             .max_admitted_subagents_for_provider(effective_provider)

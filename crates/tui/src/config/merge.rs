@@ -137,6 +137,7 @@ pub(super) fn merge_config(base: Config, override_cfg: Config) -> Config {
         snapshots: override_cfg.snapshots.or(base.snapshots),
         search: override_cfg.search.or(base.search),
         goal: override_cfg.goal.or(base.goal),
+        engine: override_cfg.engine.or(base.engine),
         memory: override_cfg.memory.or(base.memory),
         speech: override_cfg.speech.or(base.speech),
         auto: override_cfg.auto.or(base.auto),

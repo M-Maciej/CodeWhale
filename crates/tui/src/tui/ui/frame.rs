@@ -217,7 +217,7 @@ pub(crate) fn build_engine_config(app: &App, config: &Config) -> EngineConfig {
         // grant one report turn instead of dying mid-task. Embedders that
         // need the old unbounded contract pass `UNBOUNDED_MODEL_STEPS`.
         max_steps: DEFAULT_MAX_STEPS,
-        max_wall_time: DEFAULT_MAX_WALL_TIME,
+        max_wall_time: config.max_turn_wall_time(),
         max_subagents,
         max_admitted_subagents: config
             .max_admitted_subagents_for_provider(provider)

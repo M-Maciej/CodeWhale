@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use codewhale_execpolicy::ExecPolicyEngine;
@@ -2249,6 +2249,18 @@ pub struct GoalConfig {
     pub continuation_delay_seconds: Option<u64>,
 }
 
+/// Engine execution controls (`[engine]`).
+#[derive(Debug, Clone, Default, Deserialize, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct EngineControls {
+    /// Per-turn wall-clock budget in seconds for engine turns (goal
+    /// continuations, background tasks). Unset keeps the built-in 1800s
+    /// (30 minutes); `0` removes the budget entirely (unbounded); positive
+    /// values are clamped to 1..=86400 at resolution.
+    #[serde(default)]
+    pub max_turn_wall_time_secs: Option<u64>,
+}
+
 /// One configurable footer item.
 ///
 /// Order in the user's `Vec<StatusItem>` is preserved: items in the left
@@ -3092,6 +3104,11 @@ pub struct Config {
     /// `[goal] max_continuations`.
     #[serde(default)]
     pub goal: Option<GoalConfig>,
+
+    /// Engine execution controls (`[engine]`). When absent, the built-in
+    /// defaults apply.
+    #[serde(default)]
+    pub engine: Option<EngineControls>,
 
     /// User-level memory (#489). Default behaviour is **opt-in**:
     /// loading + injection happens only when `[memory] enabled = true` or
@@ -7314,6 +7331,23 @@ impl Config {
             .as_ref()
             .and_then(|cfg| cfg.default_wall_time_secs)
             .filter(|secs| *secs > 0)
+    }
+
+    /// Resolved per-turn wall-clock budget from `[engine]
+    /// max_turn_wall_time_secs`: `None` keeps the built-in default
+    /// ([`crate::core::engine::DEFAULT_MAX_WALL_TIME`], 30 minutes);
+    /// `Some(0)` is unbounded; positive values clamp to 1..=86400.
+    #[must_use]
+    pub fn max_turn_wall_time(&self) -> Duration {
+        match self
+            .engine
+            .as_ref()
+            .and_then(|engine| engine.max_turn_wall_time_secs)
+        {
+            None => crate::core::engine::DEFAULT_MAX_WALL_TIME,
+            Some(0) => Duration::ZERO,
+            Some(secs) => Duration::from_secs(secs.clamp(1, 86_400)),
+        }
     }
 
     /// Resolved per-step DeepSeek API timeout for sub-agents, in seconds.

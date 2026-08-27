@@ -138,6 +138,12 @@ pub struct ConfigSection {
     pub reasoning_effort: ReasoningEffortValue,
     #[schemars(title = "Status line items")]
     pub status_items: Vec<StatusItemValue>,
+    #[schemars(
+        title = "Max turn wall-clock (seconds)",
+        description = "Per-turn wall-clock budget for engine turns. Leave empty for the built-in 1800s (30 min); 0 = unbounded; positive values clamp to 1..=86400.",
+        range(min = 0, max = 86400)
+    )]
+    pub max_turn_wall_time_secs: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -487,6 +493,10 @@ pub fn build_document(app: &App, config: &Config) -> Result<ConfigUiDocument> {
             mcp_config_path: app.mcp_config_path.display().to_string(),
             reasoning_effort,
             status_items,
+            max_turn_wall_time_secs: config
+                .engine
+                .as_ref()
+                .and_then(|engine| engine.max_turn_wall_time_secs),
         },
     })
 }
@@ -784,8 +794,26 @@ pub fn apply_document(
     }
 
     apply_reasoning_effort(app, config, doc.config.reasoning_effort, persist)?;
+    let previous_wall_time = config
+        .engine
+        .as_ref()
+        .and_then(|engine| engine.max_turn_wall_time_secs);
+    let wall_time_changed = doc.config.max_turn_wall_time_secs != previous_wall_time;
+    if wall_time_changed {
+        config
+            .engine
+            .get_or_insert_with(Default::default)
+            .max_turn_wall_time_secs = doc.config.max_turn_wall_time_secs;
+        let rendered = match doc.config.max_turn_wall_time_secs {
+            Some(0) => "unbounded".to_string(),
+            Some(secs) => format!("{}s", secs.clamp(1, 86_400)),
+            None => "built-in default (1800s)".to_string(),
+        };
+        notes.push(format!("max_turn_wall_time_secs set to {rendered}"));
+    }
     let requires_engine_sync = app.compaction_config() != previous_compaction
-        || app.reasoning_effort != previous_reasoning_effort;
+        || app.reasoning_effort != previous_reasoning_effort
+        || wall_time_changed;
 
     let new_status_items = parse_status_items(&doc.config.status_items);
     if app.status_items != new_status_items {

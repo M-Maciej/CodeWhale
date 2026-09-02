@@ -6557,6 +6557,7 @@ fn saved_session_with_messages(messages: Vec<Message>) -> SavedSession {
         schema_version: 1,
         metadata: crate::session_manager::SessionMetadata {
             id: "resume-recovery-session".to_string(),
+            runtime_store_session_id: None,
             title: "resume recovery".to_string(),
             created_at: chrono::Utc::now(),
             updated_at: chrono::Utc::now(),
@@ -24519,4 +24520,23 @@ fn resumed_launch_keeps_the_loaded_session_id_for_the_engine() {
     let (engine, _handle) =
         crate::core::engine::Engine::new(build_engine_config(&app, &config), &config);
     assert_eq!(engine.session_id(), "800596e6-56fd-477c-9a0f-13ada7846194");
+}
+
+#[test]
+fn snapshot_stamps_the_store_id_after_a_mid_process_session_switch() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let manager =
+        crate::session_manager::SessionManager::new(tmp.path().join("sessions")).expect("manager");
+    let mut app = create_test_app();
+    // /new mints a fresh transcript id while the store stays with the boot id.
+    app.current_session_id = Some("switched-transcript-id".to_string());
+    app.store_session_id = Some("boot-store-id".to_string());
+    app.api_messages.push(text_message("user", "first turn"));
+
+    let snapshot = build_session_snapshot(&mut app, &manager).expect("session snapshot");
+    assert_eq!(snapshot.metadata.id, "switched-transcript-id");
+    assert_eq!(
+        snapshot.metadata.runtime_store_session_id.as_deref(),
+        Some("boot-store-id")
+    );
 }

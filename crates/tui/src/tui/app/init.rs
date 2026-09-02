@@ -961,6 +961,7 @@ impl App {
             pending_user_input_prompt: None,
             backtrack: crate::tui::backtrack::BacktrackState::new(),
             current_session_id: None,
+            store_session_id: None,
             last_known_work_state: None,
             last_known_goal_state: None,
             pending_goal_controls: VecDeque::new(),

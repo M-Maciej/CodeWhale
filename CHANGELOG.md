@@ -281,6 +281,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one machine no longer share one owner lock (#5630). The exclusive lock is
   unchanged; `CODEWHALE_RUNTIME_DIR` still selects a shared root when that is
   intended.
+- Hardened the per-session store: the orphan-reclaim sweep probes the store's
+  process-owner lock before deleting a session directory (a live store
+  survives), and session records carry the owning store id so `/relaunch` and
+  `--resume` re-open the right store after a mid-process `/new` or picker
+  switch.
 - Session token totals now include display-only per-model-call deltas while a
   turn is running, including input/output and cache-class counters; the
   authoritative `TurnComplete` totals still reconcile exactly once (#5581).

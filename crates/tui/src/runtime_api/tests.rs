@@ -274,6 +274,7 @@ fn saved_session_with_blocks(blocks: Vec<crate::models::ContentBlock>) -> SavedS
         schema_version: 1,
         metadata: SessionMetadata {
             id: "session-1".to_string(),
+            runtime_store_session_id: None,
             title: "test session".to_string(),
             created_at: Utc::now(),
             updated_at: Utc::now(),

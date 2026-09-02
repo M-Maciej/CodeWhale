@@ -72,6 +72,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   moves to Pod; durable receipt keys stay compatible (#5776).
 
 ### Added
+- `[tui].turn_wall_clock_secs` accepts the string `"none"` to remove the
+  per-turn wall-clock budget entirely (numbers keep clamping to
+  30..=86_400; omitted or `0` keeps the finite 3600s default). The
+  `CODEWHALE_TURN_WALL_CLOCK_SECS` env var accepts `none` too.
 
 - Native ChatGPT sign-in for the `openai-codex` route: `codewhale auth
   chatgpt` opens a browser PKCE flow and stores refreshable tokens in

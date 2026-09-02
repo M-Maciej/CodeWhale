@@ -150,7 +150,7 @@ pub fn resolve_stream_max_duration_secs(raw: Option<u64>) -> u64 {
 /// came back.
 #[derive(Debug)]
 pub(crate) struct TurnWallClock {
-    budget: Duration,
+    budget: Option<Duration>,
     started_at: Instant,
     /// Total time already excluded because the turn was blocked on a human.
     excluded: Duration,
@@ -161,8 +161,16 @@ pub(crate) struct TurnWallClock {
 impl TurnWallClock {
     /// Start a fresh budget. A zero budget is legal here (and only here):
     /// it is how tests assert the stop path without sleeping. Configuration
-    /// never produces one — [`resolve_turn_wall_clock`] rejects `0`.
+    /// never produces one — [`resolve_turn_wall_clock`] rejects `0`, and the
+    /// unbounded case is carried as `None` via [`start_optional`].
+    #[cfg(test)]
     pub(crate) fn start(budget: Duration) -> Self {
+        Self::start_optional(Some(budget))
+    }
+    /// Start a turn clock: `Some(budget)` is a finite budget, `None` is
+    /// deliberately unbounded (the turn only ends by terminal status or
+    /// user control).
+    pub(crate) fn start_optional(budget: Option<Duration>) -> Self {
         Self {
             budget,
             started_at: Instant::now(),
@@ -171,9 +179,9 @@ impl TurnWallClock {
         }
     }
 
-    /// The budget this clock was started with.
+    /// The budget this clock was started with. Zero when unbounded.
     pub(crate) fn budget(&self) -> Duration {
-        self.budget
+        self.budget.unwrap_or_default()
     }
 
     /// Wall-clock time this turn has spent on its own work, excluding time
@@ -188,9 +196,13 @@ impl TurnWallClock {
             .saturating_sub(blocked_now)
     }
 
-    /// Whether the cumulative budget is spent.
+    /// Whether the cumulative budget is spent. An unbounded clock is never
+    /// exhausted by time.
     pub(crate) fn exhausted(&self) -> bool {
-        self.spent() >= self.budget
+        match self.budget {
+            None => false,
+            Some(budget) => self.spent() >= budget,
+        }
     }
 
     /// Stop counting: the turn is now waiting on a human decision.

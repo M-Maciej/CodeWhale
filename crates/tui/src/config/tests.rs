@@ -13353,3 +13353,40 @@ fn picker_and_request_path_disagree_when_the_secret_slot_marker_is_missing() -> 
     println!("CAPTURED first-fix: {:?}", resolution.first_fix());
     Ok(())
 }
+
+#[test]
+fn turn_wall_clock_accepts_seconds_none_and_defaults() {
+    let default_cfg = Config::default();
+    assert_eq!(
+        default_cfg.turn_wall_clock(),
+        Some(Duration::from_secs(
+            crate::core::engine::turn_budget::DEFAULT_TURN_WALL_CLOCK_SECS
+        )),
+        "omitted budget keeps the finite default"
+    );
+
+    let none_cfg: Config =
+        toml::from_str("[tui]\nturn_wall_clock_secs = \"none\"\n").expect("parse none budget");
+    assert_eq!(
+        none_cfg.turn_wall_clock(),
+        None,
+        "\"none\" removes the budget entirely"
+    );
+
+    let seconds_cfg: Config =
+        toml::from_str("[tui]\nturn_wall_clock_secs = 50000\n").expect("parse seconds budget");
+    assert_eq!(
+        seconds_cfg.turn_wall_clock(),
+        Some(Duration::from_secs(50_000))
+    );
+
+    let clamped_cfg: Config =
+        toml::from_str("[tui]\nturn_wall_clock_secs = 2000000\n").expect("parse huge budget");
+    assert_eq!(
+        clamped_cfg.turn_wall_clock(),
+        Some(Duration::from_secs(
+            crate::core::engine::turn_budget::MAX_TURN_WALL_CLOCK_SECS
+        )),
+        "numbers clamp to the 24h ceiling"
+    );
+}

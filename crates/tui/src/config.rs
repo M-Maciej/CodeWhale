@@ -1742,6 +1742,59 @@ where
     }))
 }
 
+/// A configured per-turn wall-clock budget value (`[tui]
+/// turn_wall_clock_secs`): either a number of seconds (clamped
+/// 30..=86_400 at resolution) or the string `"none"` for no budget.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TurnWallClockBudget {
+    Seconds(u64),
+    None,
+}
+
+impl<'de> Deserialize<'de> for TurnWallClockBudget {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct BudgetVisitor;
+        impl serde::de::Visitor<'_> for BudgetVisitor {
+            type Value = TurnWallClockBudget;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a number of seconds or the string \"none\"")
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E> {
+                Ok(TurnWallClockBudget::Seconds(value))
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                u64::try_from(value)
+                    .map(TurnWallClockBudget::Seconds)
+                    .map_err(serde::de::Error::custom)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                if value.eq_ignore_ascii_case("none") {
+                    Ok(TurnWallClockBudget::None)
+                } else {
+                    Err(serde::de::Error::custom(format!(
+                        "expected \"none\" or a number of seconds, got {value:?}"
+                    )))
+                }
+            }
+        }
+
+        deserializer.deserialize_any(BudgetVisitor)
+    }
+}
+
 /// UI configuration loaded from config files.
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct TuiConfig {
@@ -1758,11 +1811,13 @@ pub struct TuiConfig {
     /// `1..=100_000`. There is deliberately no "unlimited" value — `0` is
     /// an invalid setting, not a sentinel that disables the cap.
     pub max_model_steps: Option<u32>,
-    /// R1: cumulative wall-clock budget for a single turn, in seconds.
-    /// Omitted or `0` resolve to the finite default (3600); explicit values
-    /// clamp to `30..=86_400`. Time blocked on a human approval decision is
-    /// excluded from the measurement.
-    pub turn_wall_clock_secs: Option<u64>,
+    /// R1: cumulative wall-clock budget for a single turn. A number of
+    /// seconds clamps to `30..=86_400`; the string `"none"` removes the
+    /// budget entirely (the turn only ends by terminal status or user
+    /// control). Omitted or `0` resolve to the finite default (3600). Time
+    /// blocked on a human approval decision is excluded from the
+    /// measurement.
+    pub turn_wall_clock_secs: Option<TurnWallClockBudget>,
     /// R1: per-step cap on accumulated streamed content, in megabytes.
     /// Omitted or `0` resolve to the default (10 MB); explicit values clamp
     /// to `64 KiB..=512 MiB`.
@@ -7541,20 +7596,37 @@ impl Config {
     /// R1: resolved cumulative per-turn wall-clock budget.
     ///
     /// Reads `[tui].turn_wall_clock_secs`, falling back to the
-    /// `CODEWHALE_TURN_WALL_CLOCK_SECS` env var, then to the finite
-    /// default. `0` resolves to the default; it never means "unlimited".
+    /// `CODEWHALE_TURN_WALL_CLOCK_SECS` env var (a number of seconds, or
+    /// `none`), then to the finite default. `0` resolves to the default; the
+    /// string `"none"` is the only way to remove the budget entirely.
     #[must_use]
-    pub fn turn_wall_clock(&self) -> std::time::Duration {
+    pub fn turn_wall_clock(&self) -> Option<std::time::Duration> {
         let raw = self
             .tui
             .as_ref()
-            .and_then(|cfg| cfg.turn_wall_clock_secs)
+            .and_then(|cfg| cfg.turn_wall_clock_secs.clone())
             .or_else(|| {
-                std::env::var(TURN_WALL_CLOCK_ENV)
-                    .ok()
-                    .and_then(|value| value.trim().parse::<u64>().ok())
+                std::env::var(TURN_WALL_CLOCK_ENV).ok().and_then(|value| {
+                    let trimmed = value.trim();
+                    if trimmed.eq_ignore_ascii_case("none") {
+                        Some(TurnWallClockBudget::None)
+                    } else {
+                        trimmed
+                            .parse::<u64>()
+                            .ok()
+                            .map(TurnWallClockBudget::Seconds)
+                    }
+                })
             });
-        crate::core::engine::turn_budget::resolve_turn_wall_clock(raw)
+        match raw {
+            None => Some(crate::core::engine::turn_budget::resolve_turn_wall_clock(
+                None,
+            )),
+            Some(TurnWallClockBudget::None) => None,
+            Some(TurnWallClockBudget::Seconds(secs)) => Some(
+                crate::core::engine::turn_budget::resolve_turn_wall_clock(Some(secs)),
+            ),
+        }
     }
 
     /// R1: resolved per-step cap on accumulated streamed content, in bytes.

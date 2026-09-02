@@ -628,8 +628,9 @@ impl Engine {
     ) -> (TurnOutcomeStatus, Option<String>) {
         // R1: restart the cumulative per-turn wall-clock budget. This is the
         // only place it is started, so exactly one turn owns it at a time.
-        self.turn_wall_clock =
-            crate::core::engine::turn_budget::TurnWallClock::start(self.config.turn_wall_clock);
+        self.turn_wall_clock = crate::core::engine::turn_budget::TurnWallClock::start_optional(
+            self.config.turn_wall_clock,
+        );
 
         // Only interactive TUI hosts own terminal chrome. Headless exec,
         // app-server, and stream-json stdout must remain byte-clean.
@@ -726,7 +727,7 @@ impl Engine {
             // named, matching how the step ceiling below reports.
             if self.turn_wall_clock.exhausted() {
                 let error = format!(
-                    "Per-turn wall-clock budget exhausted after {}s (limit: {}s). The turn was stopped before another model request; work already done is in the transcript. Send another message to continue, or raise `[tui].turn_wall_clock_secs`.",
+                    "Per-turn wall-clock budget exhausted after {}s (limit: {}s). The turn was stopped before another model request; work already done is in the transcript. Send another message to continue, or raise `[tui].turn_wall_clock_secs` (set it to `\"none\"` to remove the budget).",
                     self.turn_wall_clock.spent().as_secs(),
                     self.turn_wall_clock.budget().as_secs(),
                 );

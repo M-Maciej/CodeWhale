@@ -21314,9 +21314,14 @@ fn engine_config_defaults_carry_finite_turn_budgets() {
     );
     assert_eq!(
         config.turn_wall_clock,
-        std::time::Duration::from_secs(turn_budget::DEFAULT_TURN_WALL_CLOCK_SECS),
+        Some(std::time::Duration::from_secs(
+            turn_budget::DEFAULT_TURN_WALL_CLOCK_SECS
+        )),
     );
-    assert!(config.turn_wall_clock > std::time::Duration::ZERO);
+    assert!(
+        config.turn_wall_clock.unwrap_or_default() > std::time::Duration::ZERO,
+        "the default wall-clock budget must be finite"
+    );
     assert_eq!(
         config.stream_max_content_bytes,
         turn_budget::DEFAULT_STREAM_MAX_CONTENT_BYTES
@@ -21341,7 +21346,7 @@ async fn turn_wall_clock_budget_stops_the_turn_before_another_model_request() {
     let engine_config = EngineConfig {
         // Only tests construct a zero budget; `resolve_turn_wall_clock`
         // rejects `0` from configuration.
-        turn_wall_clock: std::time::Duration::ZERO,
+        turn_wall_clock: Some(std::time::Duration::ZERO),
         ..deterministic_engine_config(workspace.path())
     };
     let (mut engine, _handle) =
@@ -21382,7 +21387,7 @@ async fn turn_wall_clock_budget_is_overridable() {
     )]));
     let client: crate::core::model_client::SharedModelClient = mock.clone();
     let engine_config = EngineConfig {
-        turn_wall_clock: std::time::Duration::from_secs(600),
+        turn_wall_clock: Some(std::time::Duration::from_secs(600)),
         ..deterministic_engine_config(workspace.path())
     };
     let (mut engine, _handle) =

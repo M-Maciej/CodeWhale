@@ -440,9 +440,10 @@ pub struct EngineConfig {
     pub stream_chunk_timeout: Duration,
     /// Cumulative wall-clock budget for one turn (R1). Counted across every
     /// model step of the turn, excluding time blocked on a human approval
-    /// decision. Resolved from `[tui].turn_wall_clock_secs`; always finite —
-    /// see [`turn_budget::resolve_turn_wall_clock`].
-    pub turn_wall_clock: Duration,
+    /// decision. Resolved from `[tui].turn_wall_clock_secs` (a number of
+    /// seconds clamped to 30..=86400, or the string `"none"` for no budget);
+    /// `None` here means deliberately unbounded.
+    pub turn_wall_clock: Option<Duration>,
     /// Per-step cap on accumulated streamed content, in bytes (R1). Resolved
     /// from `[tui].stream_max_content_mb`. Pre-R1 this was the hard-coded
     /// `STREAM_MAX_CONTENT_BYTES`; it is still finite by default and now
@@ -572,7 +573,7 @@ impl Default for EngineConfig {
             stream_chunk_timeout: Duration::from_secs(
                 crate::config::DEFAULT_STREAM_CHUNK_TIMEOUT_SECS,
             ),
-            turn_wall_clock: turn_budget::resolve_turn_wall_clock(None),
+            turn_wall_clock: Some(turn_budget::resolve_turn_wall_clock(None)),
             stream_max_content_bytes: turn_budget::DEFAULT_STREAM_MAX_CONTENT_BYTES,
             stream_max_duration: Duration::from_secs(turn_budget::DEFAULT_STREAM_MAX_DURATION_SECS),
             subagent_heartbeat_timeout: Duration::from_secs(
@@ -1689,7 +1690,7 @@ impl Engine {
             sandbox_backend,
             sandbox_enforcement,
             current_mode: AppMode::Agent,
-            turn_wall_clock: turn_budget::TurnWallClock::start(turn_wall_clock_budget),
+            turn_wall_clock: turn_budget::TurnWallClock::start_optional(turn_wall_clock_budget),
             last_policy_narrowing: None,
             last_turn_meta_git_snapshot: StdMutex::new(None),
             token_estimate_cache: TokenEstimateCache::new(),
